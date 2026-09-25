@@ -16,6 +16,12 @@ from scripts.audit_schema_drift import (
     extract_managed_tables,
     resolve_governed_keys,
     extract_config_tag_assignments,
+    extract_tag_policies,
+    extract_fgac_policies,
+    build_rulebook,
+    is_tag_covered,
+    find_uncovered_tags,
+    _parse_condition_tag_refs,
 )
 
 
@@ -369,3 +375,232 @@ tag_assignments = [
         removed = remove_stale_assignments(abac, [])
         assert removed == 0
         assert abac.read_text() == original
+
+
+# ---------------------------------------------------------------------------
+# Rulebook drift — prod-applied tags with no covering policy or mask
+# ---------------------------------------------------------------------------
+
+class TestParseConditionTagRefs:
+    def test_has_tag_value(self):
+        vrefs, krefs = _parse_condition_tag_refs("hasTagValue('pii_level', 'masked_ssn')")
+        assert vrefs == {("pii_level", "masked_ssn")}
+        assert krefs == set()
+
+    def test_has_tag_key_only(self):
+        vrefs, krefs = _parse_condition_tag_refs("hasTag('compliance_scope')")
+        assert vrefs == set()
+        assert krefs == {"compliance_scope"}
+
+    def test_compound_condition(self):
+        cond = "hasTagValue('pii_level', 'masked_ssn') OR hasTag('compliance_scope')"
+        vrefs, krefs = _parse_condition_tag_refs(cond)
+        assert vrefs == {("pii_level", "masked_ssn")}
+        assert krefs == {"compliance_scope"}
+
+    def test_empty_and_none(self):
+        assert _parse_condition_tag_refs("") == (set(), set())
+        assert _parse_condition_tag_refs(None) == (set(), set())
+
+
+class TestBuildRulebook:
+    def test_policy_vocab_from_tag_policies(self):
+        rb = build_rulebook(
+            [{"key": "pii_level", "values": ["masked_ssn", "masked_name"]}],
+            [],
+        )
+        assert rb["policy_vocab"] == {"pii_level": {"masked_ssn", "masked_name"}}
+
+    def test_merges_duplicate_keys_across_layers(self):
+        rb = build_rulebook(
+            [
+                {"key": "pii_level", "values": ["masked_ssn"]},
+                {"key": "pii_level", "values": ["masked_name"]},
+            ],
+            [],
+        )
+        assert rb["policy_vocab"]["pii_level"] == {"masked_ssn", "masked_name"}
+
+    def test_mask_refs_from_fgac(self):
+        rb = build_rulebook(
+            [],
+            [
+                {"match_condition": "hasTagValue('pci_level', 'redacted_cvv')"},
+                {"when_condition": "hasTag('compliance_scope')"},
+            ],
+        )
+        assert rb["mask_value_refs"] == {("pci_level", "redacted_cvv")}
+        assert rb["mask_key_refs"] == {"compliance_scope"}
+
+    def test_handles_empty_inputs(self):
+        rb = build_rulebook([], [])
+        assert rb["policy_vocab"] == {}
+        assert rb["mask_value_refs"] == set()
+        assert rb["mask_key_refs"] == set()
+
+
+class TestIsTagCovered:
+    def setup_method(self):
+        self.rb = build_rulebook(
+            [{"key": "pii_level", "values": ["masked_ssn", "masked_name"]}],
+            [
+                {"match_condition": "hasTagValue('pci_level', 'redacted_cvv')"},
+                {"when_condition": "hasTag('compliance_scope')"},
+            ],
+        )
+
+    def test_covered_by_tag_policy_value(self):
+        assert is_tag_covered("pii_level", "masked_ssn", self.rb)
+
+    def test_covered_by_mask_value_ref(self):
+        assert is_tag_covered("pci_level", "redacted_cvv", self.rb)
+
+    def test_covered_by_hastag_any_value(self):
+        assert is_tag_covered("compliance_scope", "aml_restricted", self.rb)
+        assert is_tag_covered("compliance_scope", "anything_at_all", self.rb)
+
+    def test_uncovered_unknown_key(self):
+        assert not is_tag_covered("class.pii", "ssn", self.rb)
+
+    def test_uncovered_known_key_unknown_value(self):
+        # pii_level is governed, but this value is not in the vocab or any mask
+        assert not is_tag_covered("pii_level", "some_new_value", self.rb)
+
+    def test_uncovered_pci_value_not_referenced(self):
+        assert not is_tag_covered("pci_level", "masked_card_last4", self.rb)
+
+
+class TestFindUncoveredTags:
+    def _rb(self):
+        return build_rulebook(
+            [{"key": "pii_level", "values": ["masked_ssn", "masked_name"]}],
+            [{"match_condition": "hasTagValue('pii_level', 'masked_ssn')"}],
+        )
+
+    def test_fully_covered_set_passes(self):
+        """A set of applied tags all covered by policy/mask reports nothing."""
+        applied = [
+            {"catalog": "c", "schema": "s", "table": "customers",
+             "column": "ssn", "tag_key": "pii_level", "tag_value": "masked_ssn"},
+            {"catalog": "c", "schema": "s", "table": "customers",
+             "column": "first_name", "tag_key": "pii_level", "tag_value": "masked_name"},
+        ]
+        assert find_uncovered_tags(applied, self._rb()) == []
+
+    def test_detected_tag_with_no_covering_policy_is_flagged(self):
+        """A class.* classification landed in prod with no rule — must be flagged."""
+        applied = [
+            {"catalog": "c", "schema": "s", "table": "customers",
+             "column": "ssn", "tag_key": "pii_level", "tag_value": "masked_ssn"},  # covered
+            {"catalog": "prod_cat", "schema": "finance", "table": "customers",
+             "column": "passport_no", "tag_key": "class.pii", "tag_value": "ssn"},  # NOT covered
+        ]
+        uncovered = find_uncovered_tags(applied, self._rb())
+        assert len(uncovered) == 1
+        flagged = uncovered[0]
+        assert flagged["tag_key"] == "class.pii"
+        assert flagged["tag_value"] == "ssn"
+        assert flagged["column"] == "passport_no"
+        assert "unknown tag key" in flagged["reason"]
+
+    def test_governed_key_unexpected_value_is_flagged(self):
+        """Known key, but a value neither declared nor masked — flagged as value gap."""
+        applied = [
+            {"catalog": "c", "schema": "s", "table": "t",
+             "column": "col", "tag_key": "pii_level", "tag_value": "brand_new_level"},
+        ]
+        uncovered = find_uncovered_tags(applied, self._rb())
+        assert len(uncovered) == 1
+        assert "value not covered" in uncovered[0]["reason"]
+
+    def test_empty_applied_tags(self):
+        assert find_uncovered_tags([], self._rb()) == []
+
+
+class TestExtractRulebookConfig:
+    def test_extract_tag_policies_unions_account_and_generated(self, tmp_path):
+        account_dir = tmp_path / "account"
+        account_dir.mkdir()
+        (account_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "pii_level", values = ["masked_ssn"], description = "" },
+]
+""")
+        env_dir = tmp_path / "dev"
+        gen_dir = env_dir / "generated"
+        gen_dir.mkdir(parents=True)
+        (gen_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "pci_level", values = ["redacted_cvv"], description = "" },
+]
+""")
+        policies = extract_tag_policies(env_dir)
+        keys = {p["key"] for p in policies}
+        assert keys == {"pii_level", "pci_level"}
+
+    def test_extract_fgac_policies_from_data_access(self, tmp_path):
+        env_dir = tmp_path / "dev"
+        da_dir = env_dir / "data_access"
+        da_dir.mkdir(parents=True)
+        (da_dir / "abac.auto.tfvars").write_text("""\
+fgac_policies = [
+  {
+    name            = "mask_ssn"
+    policy_type     = "POLICY_TYPE_COLUMN_MASK"
+    catalog         = "c"
+    to_principals   = ["Junior_Analyst"]
+    match_condition = "hasTagValue('pii_level', 'masked_ssn')"
+    match_alias     = "cols"
+    function_name   = "mask_ssn"
+    function_catalog = "c"
+    function_schema  = "s"
+  },
+]
+""")
+        policies = extract_fgac_policies(env_dir)
+        assert len(policies) == 1
+        assert policies[0]["match_condition"] == "hasTagValue('pii_level', 'masked_ssn')"
+
+    def test_extract_missing_files(self, tmp_path):
+        env_dir = tmp_path / "dev"
+        env_dir.mkdir()
+        assert extract_tag_policies(env_dir) == []
+        assert extract_fgac_policies(env_dir) == []
+
+    def test_end_to_end_from_finance_shaped_config(self, tmp_path):
+        """Build the rulebook from config on disk, then classify applied tags."""
+        account_dir = tmp_path / "account"
+        account_dir.mkdir()
+        (account_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "pii_level", values = ["masked_ssn", "masked_name"], description = "" },
+]
+""")
+        env_dir = tmp_path / "dev"
+        da_dir = env_dir / "data_access"
+        da_dir.mkdir(parents=True)
+        (da_dir / "abac.auto.tfvars").write_text("""\
+fgac_policies = [
+  {
+    name            = "mask_ssn"
+    policy_type     = "POLICY_TYPE_COLUMN_MASK"
+    catalog         = "fin_catalog"
+    to_principals   = ["Junior_Analyst"]
+    match_condition = "hasTagValue('pii_level', 'masked_ssn')"
+    match_alias     = "cols"
+    function_name   = "mask_ssn"
+    function_catalog = "fin_catalog"
+    function_schema  = "finance"
+  },
+]
+""")
+        rb = build_rulebook(extract_tag_policies(env_dir), extract_fgac_policies(env_dir))
+        applied = [
+            {"catalog": "fin_catalog", "schema": "finance", "table": "customers",
+             "column": "ssn", "tag_key": "pii_level", "tag_value": "masked_ssn"},
+            {"catalog": "fin_catalog", "schema": "finance", "table": "customers",
+             "column": "dob", "tag_key": "class.pii", "tag_value": "date_of_birth"},
+        ]
+        uncovered = find_uncovered_tags(applied, rb)
+        assert len(uncovered) == 1
+        assert uncovered[0]["tag_key"] == "class.pii"

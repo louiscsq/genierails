@@ -21,9 +21,19 @@ from sensitivity_source import (
     CLASSIFICATION,
     LLM,
     ClassificationSource,
+    ClassificationScan,
     Finding,
     LLMSource,
+    classification_decision,
+    scan_from_run_sql,
     select_findings,
+    SCAN_CLASSIFIED,
+    SCAN_NO_TAGS,
+    SCAN_UNAVAILABLE,
+    SCAN_ERROR,
+    DECISION_USE_CLASSIFICATION,
+    DECISION_USE_LLM,
+    DECISION_FAIL_CLOSED,
 )
 from tests.conftest import assert_valid_hcl
 
@@ -248,6 +258,84 @@ class TestSelectFindings:
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed scan states + decision (BLOCKING #2)
+# ---------------------------------------------------------------------------
+class TestScanStates:
+    def test_tags_present_is_classified(self):
+        def run_sql(sql):
+            if "column_tags" in sql:
+                return [["c", "s", "t", "email", "class.email", ""]]
+            return []
+        scan = scan_from_run_sql(run_sql, ["c.s.t"])
+        assert scan.state == SCAN_CLASSIFIED
+        assert scan.is_classified is True
+        assert scan.source is not None and scan.source.has_native_data()
+
+    def test_clean_empty_scan_is_no_tags(self):
+        scan = scan_from_run_sql(lambda sql: [], ["c.s.t"])
+        assert scan.state == SCAN_NO_TAGS
+        assert scan.is_classified is False
+        assert scan.is_conclusive_negative is True
+        assert scan.is_inconclusive is True
+
+    def test_no_concrete_tables_is_unavailable(self):
+        scan = scan_from_run_sql(lambda sql: [], ["c.s.*"])
+        assert scan.state == SCAN_UNAVAILABLE
+        assert scan.is_classified is False
+
+    def test_failed_column_tags_read_is_error(self):
+        def run_sql(sql):
+            raise RuntimeError("permission denied on system.information_schema.column_tags")
+        scan = scan_from_run_sql(run_sql, ["c.s.t"])
+        assert scan.state == SCAN_ERROR
+        assert scan.source is None
+
+    def test_missing_results_table_alone_is_tolerated(self):
+        def run_sql(sql):
+            if "column_tags" in sql:
+                return [["c", "s", "t", "email", "class.email", ""]]
+            raise RuntimeError("results table missing")
+        scan = scan_from_run_sql(run_sql, ["c.s.t"])
+        assert scan.state == SCAN_CLASSIFIED
+
+    def test_states_are_distinct(self):
+        classified = scan_from_run_sql(
+            lambda s: [["c", "s", "t", "email", "class.email", ""]] if "column_tags" in s else [],
+            ["c.s.t"],
+        ).state
+        no_tags = scan_from_run_sql(lambda s: [], ["c.s.t"]).state
+        unavailable = scan_from_run_sql(lambda s: [], ["c.s.*"]).state
+        error = scan_from_run_sql(lambda s: (_ for _ in ()).throw(RuntimeError("x")), ["c.s.t"]).state
+        assert len({classified, no_tags, unavailable, error}) == 4
+
+
+class TestClassificationDecision:
+    def test_classified_always_uses_classification(self):
+        scan = ClassificationScan(
+            SCAN_CLASSIFIED,
+            ClassificationSource(tag_rows=[("c", "s", "t", "email", "class.email", "")]),
+            "1 classified column(s)",
+        )
+        assert classification_decision(scan, allow_llm_when_unverified=False) == DECISION_USE_CLASSIFICATION
+        assert classification_decision(scan, allow_llm_when_unverified=True) == DECISION_USE_CLASSIFICATION
+
+    @pytest.mark.parametrize("state", [SCAN_UNAVAILABLE, SCAN_ERROR, SCAN_NO_TAGS])
+    def test_inconclusive_fails_closed_unless_opted_in(self, state):
+        scan = ClassificationScan(state, None, "detail")
+        # default: FAIL CLOSED — never a silent LLM fallback
+        assert classification_decision(scan, allow_llm_when_unverified=False) == DECISION_FAIL_CLOSED
+        # explicit opt-in downgrades to a distinctly-logged LLM fallback
+        assert classification_decision(scan, allow_llm_when_unverified=True) == DECISION_USE_LLM
+
+    def test_fail_closed_is_distinct_from_llm_fallback(self):
+        # The three inconclusive states must NOT collapse to the same silent
+        # LLM outcome as a positive classification.
+        scan = ClassificationScan(SCAN_UNAVAILABLE, None, "no warehouse")
+        assert classification_decision(scan, False) != DECISION_USE_LLM
+        assert classification_decision(scan, False) != DECISION_USE_CLASSIFICATION
+
+
+# ---------------------------------------------------------------------------
 # Integration: generate_abac.autofix_untagged_pii_columns
 # ---------------------------------------------------------------------------
 _TFVARS = """\
@@ -367,6 +455,63 @@ class TestAutofixIntegration:
                        for a in cfg["tag_assignments"])
         out = capsys.readouterr().out
         assert "no covering masking function" in out
+
+    def test_native_replaces_existing_conflicting_llm_assignment(self, tmp_path):
+        # BLOCKING #1: an LLM-generated assignment already present for a column
+        # must be OVERRIDDEN by native classification, not left in place.
+        import generate_abac
+        tfvars = tmp_path / "abac.auto.tfvars"
+        tfvars.write_text(
+            'tag_assignments = [\n'
+            '  { entity_type = "columns", entity_name = "cat.sch.tbl.email", '
+            'tag_key = "pii_level", tag_value = "masked_email" },\n'
+            ']\n'
+        )
+        ddl = tmp_path / "ddl" / "_fetched.sql"
+        ddl.parent.mkdir(parents=True)
+        ddl.write_text("CREATE TABLE cat.sch.tbl (\n  id BIGINT,\n  email STRING\n);\n")
+        # Native classification says that column is actually a credit card.
+        classification = ClassificationSource(
+            tag_rows=[("cat", "sch", "tbl", "email", "class.credit_card", "")],
+        )
+        generate_abac.autofix_untagged_pii_columns(
+            tfvars, ddl_path=ddl, classification_source=classification,
+        )
+        cfg = assert_valid_hcl(tfvars)
+        email_tags = [a for a in cfg["tag_assignments"]
+                      if a["entity_name"] == "cat.sch.tbl.email"]
+        # exactly one assignment, and it is the native one — the LLM's
+        # masked_email was replaced, not duplicated.
+        assert len(email_tags) == 1
+        assert email_tags[0]["tag_key"] == "pci_level"
+        assert email_tags[0]["tag_value"] == "masked_card_last4"
+
+    def test_unmapped_native_removes_existing_llm_assignment(self, tmp_path):
+        # An unmapped native class is still authoritative: it must clear a
+        # pre-existing LLM assignment (and persist that removal) rather than
+        # letting the LLM tag stand.
+        import generate_abac
+        tfvars = tmp_path / "abac.auto.tfvars"
+        tfvars.write_text(
+            'tag_assignments = [\n'
+            '  { entity_type = "columns", entity_name = "cat.sch.tbl.email", '
+            'tag_key = "pii_level", tag_value = "masked_email" },\n'
+            ']\n'
+        )
+        ddl = tmp_path / "ddl" / "_fetched.sql"
+        ddl.parent.mkdir(parents=True)
+        ddl.write_text("CREATE TABLE cat.sch.tbl (\n  id BIGINT,\n  email STRING\n);\n")
+        classification = ClassificationSource(
+            tag_rows=[("cat", "sch", "tbl", "email", "class.some_novel_type", "")],
+        )
+        added = generate_abac.autofix_untagged_pii_columns(
+            tfvars, ddl_path=ddl, classification_source=classification,
+        )
+        assert added == 0
+        cfg = assert_valid_hcl(tfvars)
+        # the pre-existing LLM assignment for the classified column is gone
+        assert not any(a["entity_name"] == "cat.sch.tbl.email"
+                       for a in cfg.get("tag_assignments", []))
 
     def test_unmapped_native_class_surfaced_and_llm_suppressed(self, _paths, capsys):
         # 'contact' carries an unmapped class.* tag: no governed tag applied,

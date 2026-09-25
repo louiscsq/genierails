@@ -39,6 +39,21 @@ LLM = "llm"
 # Native UC Data Classification uses the reserved ``class`` tag namespace.
 CLASS_NAMESPACE = "class."
 
+# --- classification scan states (fail-closed contract) ---------------------
+# A scan of native UC Data Classification resolves to exactly one of these.
+# They are kept DISTINCT (never collapsed to "None / nothing sensitive") so a
+# caller can fail closed on the inconclusive states instead of silently
+# trusting LLM inference.
+SCAN_CLASSIFIED = "classified"        # scan ran; native class.* tags present
+SCAN_NO_TAGS = "no_tags"              # scan ran; no class.* tags (stale/incomplete?)
+SCAN_UNAVAILABLE = "unavailable"      # scan could not run (no warehouse/tables/conn)
+SCAN_ERROR = "error"                  # scan attempted but the read failed
+
+# --- decision outcomes -----------------------------------------------------
+DECISION_USE_CLASSIFICATION = "use_classification"  # native tags are authoritative
+DECISION_USE_LLM = "use_llm"                        # explicitly-allowed LLM fallback
+DECISION_FAIL_CLOSED = "fail_closed"                # inconclusive + not allowed → stop
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -432,3 +447,95 @@ SELECT catalog_name, schema_name, table_name, column_name, class_tag
 FROM system.data_classification.results
 WHERE concat(catalog_name, '.', schema_name, '.', table_name) IN ({table_list})"""
     return [tuple(row) for row in (run_sql(sql) or [])]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed scan resolution
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ClassificationScan:
+    """The outcome of scanning native UC Data Classification for some tables.
+
+    The ``state`` is one of the ``SCAN_*`` constants and is deliberately never
+    collapsed to a bare ``None`` — an *unavailable* or *errored* scan is a
+    different thing from a *completed scan that found nothing*, and both are
+    different from *classified*.  Callers use :func:`classification_decision` to
+    turn a scan into an action and MUST fail closed on inconclusive states
+    rather than silently inferring sensitivity via the LLM.
+    """
+
+    state: str
+    source: "ClassificationSource | None" = None
+    detail: str = ""
+
+    @property
+    def is_classified(self) -> bool:
+        return (
+            self.state == SCAN_CLASSIFIED
+            and self.source is not None
+            and self.source.has_native_data()
+        )
+
+    @property
+    def is_conclusive_negative(self) -> bool:
+        """A working scan that positively found no native classification."""
+        return self.state == SCAN_NO_TAGS
+
+    @property
+    def is_inconclusive(self) -> bool:
+        """The scan could not establish whether the data is classified."""
+        return self.state in (SCAN_UNAVAILABLE, SCAN_ERROR, SCAN_NO_TAGS)
+
+
+def scan_from_run_sql(
+    run_sql: Callable[[str], list],
+    table_refs: Sequence[str],
+    mapping: dict[str, tuple[str, str]] | None = None,
+) -> ClassificationScan:
+    """Scan native classification via an injected ``run_sql``, as a typed state.
+
+    Distinguishes: no concrete tables → :data:`SCAN_UNAVAILABLE`; a failed
+    ``column_tags`` read → :data:`SCAN_ERROR`; tags present →
+    :data:`SCAN_CLASSIFIED`; a clean read with no ``class.*`` tags →
+    :data:`SCAN_NO_TAGS`.  A missing ``data_classification.results`` table alone
+    is tolerated (it is supplementary to ``column_tags``).
+    """
+    fqns = _table_fqns_from_refs(table_refs)
+    if not fqns:
+        return ClassificationScan(
+            SCAN_UNAVAILABLE, None, "no concrete catalog.schema.table refs to scan"
+        )
+    try:
+        tag_rows = _read_class_column_tags(run_sql, fqns)
+    except Exception as exc:
+        return ClassificationScan(SCAN_ERROR, None, f"column_tags read failed: {exc}")
+    try:
+        class_rows = _read_data_classification_results(run_sql, fqns)
+    except Exception:
+        class_rows = []
+    source = ClassificationSource(tag_rows=tag_rows, classification_rows=class_rows, mapping=mapping)
+    if source.has_native_data():
+        return ClassificationScan(
+            SCAN_CLASSIFIED, source,
+            f"{len(source.classified_columns())} classified column(s)",
+        )
+    return ClassificationScan(SCAN_NO_TAGS, source, "scan completed; no class.* tags found")
+
+
+def classification_decision(scan: ClassificationScan, allow_llm_when_unverified: bool) -> str:
+    """Turn a scan into an action, failing closed by default.
+
+    * :data:`SCAN_CLASSIFIED` → :data:`DECISION_USE_CLASSIFICATION` (authoritative).
+    * Any inconclusive state (unavailable / error / no-tags) → :data:`DECISION_FAIL_CLOSED`,
+      unless ``allow_llm_when_unverified`` is set, in which case
+      :data:`DECISION_USE_LLM`.
+
+    Crucially, "no scan / no tags / query failed" is NEVER silently treated as
+    "nothing sensitive": it is either surfaced as fail-closed, or an explicit
+    opt-in downgrades it to an LLM fallback the caller can log distinctly.
+    """
+    if scan.is_classified:
+        return DECISION_USE_CLASSIFICATION
+    if allow_llm_when_unverified:
+        return DECISION_USE_LLM
+    return DECISION_FAIL_CLOSED

@@ -313,8 +313,17 @@ def _parse_condition_tag_refs(condition: str) -> tuple[set[tuple[str, str]], set
     return value_refs, key_refs
 
 
-def _is_row_filter(policy: dict) -> bool:
-    return "ROW_FILTER" in (policy.get("policy_type") or "").upper()
+COLUMN_MASK_POLICY_TYPE = "POLICY_TYPE_COLUMN_MASK"
+
+
+def _is_column_mask(policy: dict) -> bool:
+    """True only for an explicit column-mask policy.
+
+    Allowlist, not denylist: a row filter, an unknown type, or a missing
+    policy_type all return False.  Only a column mask matches COLUMN tags, so
+    only a column mask may contribute column-tag coverage.
+    """
+    return (policy.get("policy_type") or "").strip().upper() == COLUMN_MASK_POLICY_TYPE
 
 
 def build_rulebook(tag_policies: list[dict], fgac_policies: list[dict]) -> dict:
@@ -325,12 +334,14 @@ def build_rulebook(tag_policies: list[dict], fgac_policies: list[dict]) -> dict:
 
       - tag_policies declare the governance vocabulary: key -> {allowed values}.
         These are metastore-level, so their coverage is catalog-independent.
-      - COLUMN MASK fgac_policies reference tags in their `match_condition`
+      - COLUMN MASK fgac_policies (policy_type == POLICY_TYPE_COLUMN_MASK, and
+        ONLY those — allowlist) reference tags in their `match_condition`
         (hasTagValue()/hasTag()).  A mask only enforces within its own `catalog`,
         so this coverage is scoped PER CATALOG — a mask in catalog A does not
         cover a tag applied in catalog B.
-      - ROW FILTER fgac_policies use `when_condition` against TABLE tags and are
-        deliberately EXCLUDED: they never cover a column tag.
+      - Everything else — ROW FILTER (when_condition on TABLE tags), unknown
+        policy types, and a missing policy_type — is EXCLUDED and never covers a
+        column tag.
 
     Returns a dict:
       policy_vocab:    {key: {allowed value, ...}}                  (global)
@@ -347,9 +358,10 @@ def build_rulebook(tag_policies: list[dict], fgac_policies: list[dict]) -> dict:
     mask_value_refs: dict[str, set[tuple[str, str]]] = {}
     mask_key_refs: dict[str, set[str]] = {}
     for p in fgac_policies or []:
-        # Row filters match TABLE tags via when_condition — irrelevant to a
-        # column_tags audit.  Column masks match COLUMN tags via match_condition.
-        if _is_row_filter(p):
+        # Only an explicit column mask matches COLUMN tags (via match_condition).
+        # Row filters (when_condition on TABLE tags), unknown types, and a missing
+        # policy_type are all excluded — coverage requires POLICY_TYPE_COLUMN_MASK.
+        if not _is_column_mask(p):
             continue
         catalog = p.get("catalog", "") or ""
         value_refs, key_refs = _parse_condition_tag_refs(p.get("match_condition") or "")

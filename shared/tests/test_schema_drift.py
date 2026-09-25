@@ -447,6 +447,28 @@ class TestBuildRulebook:
         assert rb["mask_value_refs"] == {}
         assert rb["mask_key_refs"] == {}
 
+    def test_unknown_policy_type_contributes_no_coverage(self):
+        """Allowlist: only POLICY_TYPE_COLUMN_MASK contributes. An unknown type
+        with a match_condition must NOT provide coverage."""
+        rb = build_rulebook(
+            [],
+            [{"policy_type": "POLICY_TYPE_FUTURE_THING", "catalog": "cat_a",
+              "match_condition": "hasTagValue('pii_level', 'masked_ssn')"}],
+        )
+        assert rb["mask_value_refs"] == {}
+        assert rb["mask_key_refs"] == {}
+
+    def test_missing_policy_type_contributes_no_coverage(self):
+        """Allowlist: a policy with a match_condition but NO policy_type must NOT
+        provide coverage."""
+        rb = build_rulebook(
+            [],
+            [{"catalog": "cat_a",
+              "match_condition": "hasTagValue('pii_level', 'masked_ssn')"}],
+        )
+        assert rb["mask_value_refs"] == {}
+        assert rb["mask_key_refs"] == {}
+
     def test_handles_empty_inputs(self):
         rb = build_rulebook([], [])
         assert rb["policy_vocab"] == {}
@@ -563,6 +585,22 @@ class TestFindUncoveredTags:
         uncovered = find_uncovered_tags(applied, rb)
         assert len(uncovered) == 1
         assert uncovered[0]["tag_key"] == "compliance_scope"
+
+    def test_unknown_policy_type_does_not_suppress_flag(self):
+        """A match_condition on a non-column-mask (unknown) type must NOT cover a
+        tag — the genuinely uncovered tag is still flagged, not suppressed."""
+        rb = build_rulebook(
+            [],
+            [{"policy_type": "SOMETHING_ELSE", "catalog": "c",
+              "match_condition": "hasTagValue('pii_level', 'masked_ssn')"}],
+        )
+        applied = [
+            {"catalog": "c", "schema": "s", "table": "t", "column": "ssn",
+             "tag_key": "pii_level", "tag_value": "masked_ssn"},
+        ]
+        uncovered = find_uncovered_tags(applied, rb)
+        assert len(uncovered) == 1
+        assert uncovered[0]["tag_key"] == "pii_level"
 
     def test_empty_applied_tags(self):
         assert find_uncovered_tags([], self._rb()) == []

@@ -109,10 +109,19 @@ make apply ENV=dev
 
 `make audit-rulebook` reads `system.information_schema.column_tags` for the managed
 tables and compares each applied tag key/value against the RULEBOOK (`tag_policies` +
-`fgac_policies` in the config). It catches the case where an automatic classification
-or an out-of-band `SET TAGS` lands a tag in production that the governance config never
-anticipated — so no mask or row filter will act on it. (Both audits also run under
-`make audit-schema ... --mode all` via the script directly.)
+column-mask `fgac_policies` in the config). It catches the case where an automatic
+classification or an out-of-band `SET TAGS` lands a tag in production that the
+governance config never anticipated — so no mask will act on it. Coverage is matched
+per catalog (a mask in one catalog does not cover a tag in another) and only column
+masks count; a row filter's `when_condition` targets table tags, not column tags.
+
+The `make` targets each run a fixed mode (`audit-schema` → forward + reverse,
+`audit-rulebook` → rulebook). To run all three checks in one pass, invoke the script
+directly from the env directory:
+
+```bash
+cd envs/dev && python3 "$SHARED_ROOT/scripts/audit_schema_drift.py" --mode all
+```
 
 | Schema change | What happens |
 | --- | --- |

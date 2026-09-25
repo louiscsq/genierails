@@ -18,11 +18,13 @@ from scripts.audit_schema_drift import (
     extract_config_tag_assignments,
     extract_tag_policies,
     extract_fgac_policies,
+    rulebook_query_keys,
     build_rulebook,
     is_tag_covered,
     find_uncovered_tags,
     _parse_condition_tag_refs,
 )
+import scripts.audit_schema_drift as audit_mod
 
 
 # ---------------------------------------------------------------------------
@@ -421,22 +423,35 @@ class TestBuildRulebook:
         )
         assert rb["policy_vocab"]["pii_level"] == {"masked_ssn", "masked_name"}
 
-    def test_mask_refs_from_fgac(self):
+    def test_column_mask_refs_scoped_by_catalog(self):
         rb = build_rulebook(
             [],
             [
-                {"match_condition": "hasTagValue('pci_level', 'redacted_cvv')"},
-                {"when_condition": "hasTag('compliance_scope')"},
+                {"policy_type": "POLICY_TYPE_COLUMN_MASK", "catalog": "cat_a",
+                 "match_condition": "hasTagValue('pci_level', 'redacted_cvv')"},
+                {"policy_type": "POLICY_TYPE_COLUMN_MASK", "catalog": "cat_b",
+                 "match_condition": "hasTag('other_key')"},
             ],
         )
-        assert rb["mask_value_refs"] == {("pci_level", "redacted_cvv")}
-        assert rb["mask_key_refs"] == {"compliance_scope"}
+        assert rb["mask_value_refs"] == {"cat_a": {("pci_level", "redacted_cvv")}}
+        assert rb["mask_key_refs"] == {"cat_b": {"other_key"}}
+
+    def test_row_filter_when_condition_excluded(self):
+        """A row-filter's when_condition targets TABLE tags — must not enter the
+        column-tag rulebook at all."""
+        rb = build_rulebook(
+            [],
+            [{"policy_type": "POLICY_TYPE_ROW_FILTER", "catalog": "cat_a",
+              "when_condition": "hasTagValue('compliance_scope', 'aml_restricted')"}],
+        )
+        assert rb["mask_value_refs"] == {}
+        assert rb["mask_key_refs"] == {}
 
     def test_handles_empty_inputs(self):
         rb = build_rulebook([], [])
         assert rb["policy_vocab"] == {}
-        assert rb["mask_value_refs"] == set()
-        assert rb["mask_key_refs"] == set()
+        assert rb["mask_value_refs"] == {}
+        assert rb["mask_key_refs"] == {}
 
 
 class TestIsTagCovered:
@@ -444,37 +459,41 @@ class TestIsTagCovered:
         self.rb = build_rulebook(
             [{"key": "pii_level", "values": ["masked_ssn", "masked_name"]}],
             [
-                {"match_condition": "hasTagValue('pci_level', 'redacted_cvv')"},
-                {"when_condition": "hasTag('compliance_scope')"},
+                {"policy_type": "POLICY_TYPE_COLUMN_MASK", "catalog": "fin_catalog",
+                 "match_condition": "hasTagValue('pci_level', 'redacted_cvv')"},
+                {"policy_type": "POLICY_TYPE_COLUMN_MASK", "catalog": "fin_catalog",
+                 "match_condition": "hasTag('any_val_key')"},
             ],
         )
 
-    def test_covered_by_tag_policy_value(self):
-        assert is_tag_covered("pii_level", "masked_ssn", self.rb)
+    def test_covered_by_tag_policy_value_any_catalog(self):
+        # tag_policies are metastore-level — covered regardless of catalog
+        assert is_tag_covered("fin_catalog", "pii_level", "masked_ssn", self.rb)
+        assert is_tag_covered("other_catalog", "pii_level", "masked_ssn", self.rb)
 
-    def test_covered_by_mask_value_ref(self):
-        assert is_tag_covered("pci_level", "redacted_cvv", self.rb)
+    def test_covered_by_in_catalog_mask_value_ref(self):
+        assert is_tag_covered("fin_catalog", "pci_level", "redacted_cvv", self.rb)
 
-    def test_covered_by_hastag_any_value(self):
-        assert is_tag_covered("compliance_scope", "aml_restricted", self.rb)
-        assert is_tag_covered("compliance_scope", "anything_at_all", self.rb)
+    def test_mask_does_not_cover_other_catalog(self):
+        # same tag, different catalog — the mask in fin_catalog must NOT cover it
+        assert not is_tag_covered("other_catalog", "pci_level", "redacted_cvv", self.rb)
+
+    def test_covered_by_hastag_any_value_in_catalog(self):
+        assert is_tag_covered("fin_catalog", "any_val_key", "whatever", self.rb)
 
     def test_uncovered_unknown_key(self):
-        assert not is_tag_covered("class.pii", "ssn", self.rb)
+        assert not is_tag_covered("fin_catalog", "class.pii", "ssn", self.rb)
 
     def test_uncovered_known_key_unknown_value(self):
-        # pii_level is governed, but this value is not in the vocab or any mask
-        assert not is_tag_covered("pii_level", "some_new_value", self.rb)
-
-    def test_uncovered_pci_value_not_referenced(self):
-        assert not is_tag_covered("pci_level", "masked_card_last4", self.rb)
+        assert not is_tag_covered("fin_catalog", "pii_level", "some_new_value", self.rb)
 
 
 class TestFindUncoveredTags:
     def _rb(self):
         return build_rulebook(
             [{"key": "pii_level", "values": ["masked_ssn", "masked_name"]}],
-            [{"match_condition": "hasTagValue('pii_level', 'masked_ssn')"}],
+            [{"policy_type": "POLICY_TYPE_COLUMN_MASK", "catalog": "c",
+              "match_condition": "hasTagValue('pii_level', 'masked_ssn')"}],
         )
 
     def test_fully_covered_set_passes(self):
@@ -512,6 +531,38 @@ class TestFindUncoveredTags:
         uncovered = find_uncovered_tags(applied, self._rb())
         assert len(uncovered) == 1
         assert "value not covered" in uncovered[0]["reason"]
+
+    def test_cross_catalog_mask_does_not_cover(self):
+        """A custom tag masked only in catalog A, applied in catalog B, is drift."""
+        rb = build_rulebook(
+            [],  # no tag_policy declares this key — coverage can only come from a mask
+            [{"policy_type": "POLICY_TYPE_COLUMN_MASK", "catalog": "cat_a",
+              "match_condition": "hasTagValue('team_tag', 'secret')"}],
+        )
+        applied = [
+            {"catalog": "cat_a", "schema": "s", "table": "t",
+             "column": "col", "tag_key": "team_tag", "tag_value": "secret"},  # covered
+            {"catalog": "cat_b", "schema": "s", "table": "t",
+             "column": "col", "tag_key": "team_tag", "tag_value": "secret"},  # NOT covered
+        ]
+        uncovered = find_uncovered_tags(applied, rb)
+        assert len(uncovered) == 1
+        assert uncovered[0]["catalog"] == "cat_b"
+
+    def test_row_filter_does_not_cover_column_tag(self):
+        """A column tag referenced only by a row-filter when_condition is NOT covered."""
+        rb = build_rulebook(
+            [],
+            [{"policy_type": "POLICY_TYPE_ROW_FILTER", "catalog": "c",
+              "when_condition": "hasTagValue('compliance_scope', 'aml_restricted')"}],
+        )
+        applied = [
+            {"catalog": "c", "schema": "s", "table": "t", "column": "region",
+             "tag_key": "compliance_scope", "tag_value": "aml_restricted"},
+        ]
+        uncovered = find_uncovered_tags(applied, rb)
+        assert len(uncovered) == 1
+        assert uncovered[0]["tag_key"] == "compliance_scope"
 
     def test_empty_applied_tags(self):
         assert find_uncovered_tags([], self._rb()) == []
@@ -604,3 +655,96 @@ fgac_policies = [
         uncovered = find_uncovered_tags(applied, rb)
         assert len(uncovered) == 1
         assert uncovered[0]["tag_key"] == "class.pii"
+
+
+class TestRulebookQueryKeys:
+    def test_key_only_in_tag_policies_is_queried(self, tmp_path):
+        """A governed key declared in data_access tag_policies but never assigned
+        must still be in the query set (issue 1: assignment-only would miss it)."""
+        env_dir = tmp_path / "dev"
+        da_dir = env_dir / "data_access"
+        da_dir.mkdir(parents=True)
+        (da_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "custom_governance_key", values = ["restricted"], description = "" },
+]
+""")
+        keys = rulebook_query_keys(env_dir)
+        assert "custom_governance_key" in keys
+
+    def test_unions_governed_keys_and_all_layer_tag_policy_keys(self, tmp_path):
+        account_dir = tmp_path / "account"
+        account_dir.mkdir()
+        (account_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "pii_level", values = ["masked_ssn"], description = "" },
+]
+""")
+        env_dir = tmp_path / "dev"
+        da_dir = env_dir / "data_access"
+        da_dir.mkdir(parents=True)
+        (da_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "da_only_key", values = ["x"], description = "" },
+]
+""")
+        keys = set(rulebook_query_keys(env_dir))
+        assert {"pii_level", "da_only_key"} <= keys
+
+
+class TestMainRulebookExit:
+    """main() end-to-end with the Databricks seams mocked."""
+
+    def _write_env(self, tmp_path):
+        env_dir = tmp_path / "dev"
+        da_dir = env_dir / "data_access"
+        da_dir.mkdir(parents=True)
+        (env_dir / "env.auto.tfvars").write_text("""\
+uc_tables = ["prod_cat.finance.customers"]
+sql_warehouse_id = "wh-123"
+""")
+        (da_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "pii_level", values = ["masked_ssn"], description = "" },
+]
+fgac_policies = [
+  {
+    name            = "mask_ssn"
+    policy_type     = "POLICY_TYPE_COLUMN_MASK"
+    catalog         = "prod_cat"
+    to_principals   = ["Junior_Analyst"]
+    match_condition = "hasTagValue('pii_level', 'masked_ssn')"
+    match_alias     = "cols"
+    function_name   = "mask_ssn"
+    function_catalog = "prod_cat"
+    function_schema  = "finance"
+  },
+]
+""")
+        return env_dir
+
+    def _mock_seams(self, monkeypatch, applied):
+        monkeypatch.setattr(audit_mod, "_get_sdk_client", lambda env_dir: object())
+        monkeypatch.setattr(audit_mod, "_get_warehouse_id", lambda env_dir, w: "wh-123")
+        monkeypatch.setattr(
+            audit_mod, "_query_applied_tags",
+            lambda w, wh, tables, keys: applied,
+        )
+
+    def test_rulebook_drift_exits_1(self, tmp_path, monkeypatch):
+        env_dir = self._write_env(tmp_path)
+        monkeypatch.chdir(env_dir)
+        self._mock_seams(monkeypatch, [
+            {"catalog": "prod_cat", "schema": "finance", "table": "customers",
+             "column": "dob", "tag_key": "class.pii", "tag_value": "date_of_birth"},
+        ])
+        assert audit_mod.main(["--mode", "rulebook"]) == 1
+
+    def test_rulebook_clean_exits_0(self, tmp_path, monkeypatch):
+        env_dir = self._write_env(tmp_path)
+        monkeypatch.chdir(env_dir)
+        self._mock_seams(monkeypatch, [
+            {"catalog": "prod_cat", "schema": "finance", "table": "customers",
+             "column": "ssn", "tag_key": "pii_level", "tag_value": "masked_ssn"},
+        ])
+        assert audit_mod.main(["--mode", "rulebook"]) == 0

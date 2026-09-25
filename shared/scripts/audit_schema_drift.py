@@ -165,6 +165,25 @@ def extract_fgac_policies(env_dir: Path) -> list[dict]:
     return policies
 
 
+def rulebook_query_keys(env_dir: Path) -> list[str]:
+    """Tag keys to query from column_tags for the rulebook audit.
+
+    Union of:
+      - resolve_governed_keys() (assignment/policy resolution used by the other modes), and
+      - every key DECLARED in tag_policies across all config layers.
+
+    Declared-but-not-yet-assigned keys must be included: a governed key declared
+    in tag_policies and then newly (or out-of-band) applied in prod would never
+    be queried if we relied on existing assignments alone — a false negative.
+    """
+    keys = set(resolve_governed_keys(env_dir))
+    for tp in extract_tag_policies(env_dir):
+        key = tp.get("key")
+        if key:
+            keys.add(key)
+    return sorted(keys)
+
+
 def _get_sdk_client(env_dir: Path):
     """Build a WorkspaceClient from auth.auto.tfvars."""
     cfg = _load_hcl(env_dir / "auth.auto.tfvars")
@@ -294,18 +313,29 @@ def _parse_condition_tag_refs(condition: str) -> tuple[set[tuple[str, str]], set
     return value_refs, key_refs
 
 
-def build_rulebook(tag_policies: list[dict], fgac_policies: list[dict]) -> dict:
-    """Compile the RULEBOOK: what tag keys/values the config governs or enforces.
+def _is_row_filter(policy: dict) -> bool:
+    return "ROW_FILTER" in (policy.get("policy_type") or "").upper()
 
-    Coverage comes from two sources:
+
+def build_rulebook(tag_policies: list[dict], fgac_policies: list[dict]) -> dict:
+    """Compile the RULEBOOK for COLUMN-tag coverage.
+
+    This audit reads `system.information_schema.column_tags`, so a COLUMN tag is
+    covered only by things that actually act on column tags:
+
       - tag_policies declare the governance vocabulary: key -> {allowed values}.
-      - fgac_policies (column masks / row filters) reference tags in their
-        hasTagValue()/hasTag() conditions — the tags a rule actually enforces.
+        These are metastore-level, so their coverage is catalog-independent.
+      - COLUMN MASK fgac_policies reference tags in their `match_condition`
+        (hasTagValue()/hasTag()).  A mask only enforces within its own `catalog`,
+        so this coverage is scoped PER CATALOG — a mask in catalog A does not
+        cover a tag applied in catalog B.
+      - ROW FILTER fgac_policies use `when_condition` against TABLE tags and are
+        deliberately EXCLUDED: they never cover a column tag.
 
     Returns a dict:
-      policy_vocab:    {key: {allowed value, ...}}   from tag_policies
-      mask_value_refs: {(key, value), ...}           from hasTagValue()
-      mask_key_refs:   {key, ...}                     from hasTag()  (any value)
+      policy_vocab:    {key: {allowed value, ...}}                  (global)
+      mask_value_refs: {catalog: {(key, value), ...}}   from column-mask match_condition
+      mask_key_refs:   {catalog: {key, ...}}            from column-mask hasTag() (any value)
     """
     policy_vocab: dict[str, set[str]] = {}
     for tp in tag_policies or []:
@@ -314,13 +344,19 @@ def build_rulebook(tag_policies: list[dict], fgac_policies: list[dict]) -> dict:
             continue
         policy_vocab.setdefault(key, set()).update(v for v in (tp.get("values") or []) if v)
 
-    mask_value_refs: set[tuple[str, str]] = set()
-    mask_key_refs: set[str] = set()
+    mask_value_refs: dict[str, set[tuple[str, str]]] = {}
+    mask_key_refs: dict[str, set[str]] = {}
     for p in fgac_policies or []:
-        condition = p.get("match_condition") or p.get("when_condition") or ""
-        value_refs, key_refs = _parse_condition_tag_refs(condition)
-        mask_value_refs |= value_refs
-        mask_key_refs |= key_refs
+        # Row filters match TABLE tags via when_condition — irrelevant to a
+        # column_tags audit.  Column masks match COLUMN tags via match_condition.
+        if _is_row_filter(p):
+            continue
+        catalog = p.get("catalog", "") or ""
+        value_refs, key_refs = _parse_condition_tag_refs(p.get("match_condition") or "")
+        if value_refs:
+            mask_value_refs.setdefault(catalog, set()).update(value_refs)
+        if key_refs:
+            mask_key_refs.setdefault(catalog, set()).update(key_refs)
 
     return {
         "policy_vocab": policy_vocab,
@@ -329,26 +365,31 @@ def build_rulebook(tag_policies: list[dict], fgac_policies: list[dict]) -> dict:
     }
 
 
-def is_tag_covered(tag_key: str, tag_value: str, rulebook: dict) -> bool:
-    """True if a policy declares this tag key/value or a mask/filter references it."""
-    if (tag_key, tag_value) in rulebook["mask_value_refs"]:
-        return True
-    if tag_key in rulebook["mask_key_refs"]:
-        return True
+def is_tag_covered(catalog: str, tag_key: str, tag_value: str, rulebook: dict) -> bool:
+    """True if a tag_policy declares this key/value, or a COLUMN MASK in the SAME
+    catalog references it."""
     allowed = rulebook["policy_vocab"].get(tag_key)
-    return allowed is not None and tag_value in allowed
+    if allowed is not None and tag_value in allowed:
+        return True
+    if (tag_key, tag_value) in rulebook["mask_value_refs"].get(catalog, set()):
+        return True
+    if tag_key in rulebook["mask_key_refs"].get(catalog, set()):
+        return True
+    return False
 
 
-def _coverage_gap(tag_key: str, tag_value: str, rulebook: dict) -> str:
+def _coverage_gap(catalog: str, tag_key: str, tag_value: str, rulebook: dict) -> str:
     """Human-readable reason a tag is uncovered (assumes is_tag_covered is False)."""
+    cat_value_refs = rulebook["mask_value_refs"].get(catalog, set())
+    cat_key_refs = rulebook["mask_key_refs"].get(catalog, set())
     known_key = (
         tag_key in rulebook["policy_vocab"]
-        or tag_key in rulebook["mask_key_refs"]
-        or any(k == tag_key for k, _ in rulebook["mask_value_refs"])
+        or tag_key in cat_key_refs
+        or any(k == tag_key for k, _ in cat_value_refs)
     )
     if not known_key:
-        return "unknown tag key — no tag_policy declares it and no mask/filter references it"
-    return "value not covered — key is governed but no policy value or mask covers this value"
+        return "unknown tag key — no tag_policy declares it and no column mask in this catalog references it"
+    return "value not covered — key is governed but no policy value or in-catalog column mask covers this value"
 
 
 def find_uncovered_tags(applied_tags: list[dict], rulebook: dict) -> list[dict]:
@@ -359,9 +400,10 @@ def find_uncovered_tags(applied_tags: list[dict], rulebook: dict) -> list[dict]:
     """
     uncovered: list[dict] = []
     for t in applied_tags:
-        if is_tag_covered(t["tag_key"], t["tag_value"], rulebook):
+        catalog = t["catalog"]
+        if is_tag_covered(catalog, t["tag_key"], t["tag_value"], rulebook):
             continue
-        uncovered.append({**t, "reason": _coverage_gap(t["tag_key"], t["tag_value"], rulebook)})
+        uncovered.append({**t, "reason": _coverage_gap(catalog, t["tag_key"], t["tag_value"], rulebook)})
     return uncovered
 
 
@@ -485,8 +527,10 @@ def main(argv: list[str] | None = None) -> int:
         rulebook = build_rulebook(
             extract_tag_policies(env_dir), extract_fgac_policies(env_dir),
         )
+        query_keys = rulebook_query_keys(env_dir)
+        print(f"  Rulebook query keys: {query_keys}")
         uncovered = detect_rulebook_drift(
-            w, warehouse_id, managed_tables, governed_keys, rulebook,
+            w, warehouse_id, managed_tables, query_keys, rulebook,
         )
         if uncovered:
             drift_found = True

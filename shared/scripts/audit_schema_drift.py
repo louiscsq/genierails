@@ -9,12 +9,15 @@ Three independent checks, selected with --mode:
   reverse drift — tag_assignments in config whose entity_name references a
     column that no longer exists in the workspace.  A "stale rule".
 
-  rulebook drift — tags ACTUALLY applied in the workspace (from
-    system.information_schema.column_tags, including the `class.*` classification
-    namespace and the governed tag keys) that NO policy or mask covers.  The
-    "new prod tag with no rule" case: a classification landed on a column but the
-    RULEBOOK (tag_policies + fgac_policies in the config) neither declares that
-    tag key/value nor references it from any column mask or row filter.
+  rulebook drift — tags ACTUALLY applied in the workspace (EVERY column tag on
+    the in-scope tables, from system.information_schema.column_tags — including
+    the `class.*` classification namespace and any governance key, without
+    restricting to keys still present in the config) that NO policy or mask
+    covers.  The "new prod tag with no rule" case AND the "rule dropped in
+    promotion, orphaned tag left behind" case: the RULEBOOK is derived from the
+    PROMOTED config only (account + data_access tag_policies + column-mask
+    fgac_policies; the local generated/ draft is excluded), so a tag whose key
+    was dropped from promotion has no coverage and is flagged.
 
 --mode drift    (default) runs forward + reverse — the original behaviour.
 --mode rulebook runs only the rulebook check.
@@ -129,18 +132,19 @@ def extract_config_tag_assignments(env_dir: Path) -> list[dict]:
 
 
 def extract_tag_policies(env_dir: Path) -> list[dict]:
-    """Union of tag_policies across the config layers that can declare them.
+    """tag_policies from the PROMOTED config only (the coverage source of truth).
 
-    tag_policies live in the account layer (shared) and in generated/ (pre-split
-    draft); data_access/ carries them too in the split layout.  We union across
-    all of them so the rulebook reflects every declared governance tag, wherever
-    the config keeps it.  Duplicate keys are harmless — build_rulebook() merges
-    their allowed values.
+    The rulebook must reflect what is actually promoted — account/abac.auto.tfvars
+    (shared groups + tag_policies) and <env>/data_access/abac.auto.tfvars.  The
+    local generated/ draft is DELIBERATELY excluded: a rule dropped during
+    `make promote` but still lingering in the pre-split draft must NOT be counted
+    as coverage, or a dropped rule's orphaned prod tag would be masked.
+    Duplicate keys across the two promoted layers are harmless — build_rulebook()
+    merges their allowed values.
     """
     policies: list[dict] = []
     for path in [
         env_dir.parent / "account" / "abac.auto.tfvars",
-        env_dir / "generated" / "abac.auto.tfvars",
         env_dir / "data_access" / "abac.auto.tfvars",
     ]:
         cfg = _load_hcl(path)
@@ -149,39 +153,15 @@ def extract_tag_policies(env_dir: Path) -> list[dict]:
 
 
 def extract_fgac_policies(env_dir: Path) -> list[dict]:
-    """Union of fgac_policies (column masks + row filters) across config layers.
+    """fgac_policies (column masks + row filters) from the PROMOTED config only.
 
-    fgac_policies live in the data_access layer and in generated/ (pre-split
-    draft).  These carry the hasTagValue()/hasTag() conditions that reference the
-    tags a mask or row filter actually enforces.
+    Reads <env>/data_access/abac.auto.tfvars.  The local generated/ draft is
+    DELIBERATELY excluded (see extract_tag_policies): coverage is derived strictly
+    from what was promoted, so a rule dropped in promotion cannot be masked by a
+    stale draft entry.
     """
-    policies: list[dict] = []
-    for path in [
-        env_dir / "data_access" / "abac.auto.tfvars",
-        env_dir / "generated" / "abac.auto.tfvars",
-    ]:
-        cfg = _load_hcl(path)
-        policies.extend(cfg.get("fgac_policies", []) or [])
-    return policies
-
-
-def rulebook_query_keys(env_dir: Path) -> list[str]:
-    """Tag keys to query from column_tags for the rulebook audit.
-
-    Union of:
-      - resolve_governed_keys() (assignment/policy resolution used by the other modes), and
-      - every key DECLARED in tag_policies across all config layers.
-
-    Declared-but-not-yet-assigned keys must be included: a governed key declared
-    in tag_policies and then newly (or out-of-band) applied in prod would never
-    be queried if we relied on existing assignments alone — a false negative.
-    """
-    keys = set(resolve_governed_keys(env_dir))
-    for tp in extract_tag_policies(env_dir):
-        key = tp.get("key")
-        if key:
-            keys.add(key)
-    return sorted(keys)
+    cfg = _load_hcl(env_dir / "data_access" / "abac.auto.tfvars")
+    return list(cfg.get("fgac_policies", []) or [])
 
 
 def _get_sdk_client(env_dir: Path):
@@ -419,31 +399,31 @@ def find_uncovered_tags(applied_tags: list[dict], rulebook: dict) -> list[dict]:
     return uncovered
 
 
-def _query_applied_tags(
-    w, warehouse_id: str, managed_tables: list[str], governed_keys: list[str],
-) -> list[dict]:
-    """Read tags actually applied to columns of the managed tables.
+def _applied_tags_sql(managed_tables: list[str]) -> str:
+    """SQL that reads EVERY column tag applied to the managed tables.
 
-    Scoped to the `class.*` classification namespace plus the governed tag keys.
+    Deliberately NOT restricted to `class.*` or to currently-known governed
+    keys: a governance/enforcement tag whose key was COMPLETELY dropped during
+    promotion still lingers in prod under a key no longer discoverable from the
+    config.  Restricting the query to known keys would exclude that orphaned tag
+    and it could never be flagged.  We fetch every applied tag and let the
+    rulebook comparison decide coverage, so a dropped rule's orphaned tag surfaces
+    as uncovered.
     """
+    table_list = ", ".join(f"'{t}'" for t in managed_tables)
+    return f"""\
+SELECT catalog_name, schema_name, table_name, column_name, tag_name, tag_value
+FROM system.information_schema.column_tags
+WHERE concat(catalog_name, '.', schema_name, '.', table_name) IN ({table_list})
+ORDER BY catalog_name, schema_name, table_name, column_name, tag_name"""
+
+
+def _query_applied_tags(w, warehouse_id: str, managed_tables: list[str]) -> list[dict]:
+    """Read every tag applied to columns of the managed tables (unrestricted)."""
     if not managed_tables:
         return []
 
-    table_list = ", ".join(f"'{t}'" for t in managed_tables)
-    tag_filters = ["tag_name LIKE 'class.%'"]
-    if governed_keys:
-        key_list = ", ".join(f"'{k}'" for k in governed_keys)
-        tag_filters.append(f"tag_name IN ({key_list})")
-    tag_filter = " OR ".join(tag_filters)
-
-    sql = f"""\
-SELECT catalog_name, schema_name, table_name, column_name, tag_name, tag_value
-FROM system.information_schema.column_tags
-WHERE ({tag_filter})
-  AND concat(catalog_name, '.', schema_name, '.', table_name) IN ({table_list})
-ORDER BY catalog_name, schema_name, table_name, column_name, tag_name"""
-
-    rows = _run_sql(w, warehouse_id, sql)
+    rows = _run_sql(w, warehouse_id, _applied_tags_sql(managed_tables))
     applied = []
     for row in rows:
         applied.append({
@@ -458,11 +438,10 @@ ORDER BY catalog_name, schema_name, table_name, column_name, tag_name"""
 
 
 def detect_rulebook_drift(
-    w, warehouse_id: str, managed_tables: list[str], governed_keys: list[str],
-    rulebook: dict,
+    w, warehouse_id: str, managed_tables: list[str], rulebook: dict,
 ) -> list[dict]:
     """Find prod-applied tags that no policy or mask in the rulebook covers."""
-    applied = _query_applied_tags(w, warehouse_id, managed_tables, governed_keys)
+    applied = _query_applied_tags(w, warehouse_id, managed_tables)
     return find_uncovered_tags(applied, rulebook)
 
 
@@ -539,11 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         rulebook = build_rulebook(
             extract_tag_policies(env_dir), extract_fgac_policies(env_dir),
         )
-        query_keys = rulebook_query_keys(env_dir)
-        print(f"  Rulebook query keys: {query_keys}")
-        uncovered = detect_rulebook_drift(
-            w, warehouse_id, managed_tables, query_keys, rulebook,
-        )
+        uncovered = detect_rulebook_drift(w, warehouse_id, managed_tables, rulebook)
         if uncovered:
             drift_found = True
             print(f"\n  RULEBOOK DRIFT: {len(uncovered)} applied tag(s) with no covering policy/mask:")

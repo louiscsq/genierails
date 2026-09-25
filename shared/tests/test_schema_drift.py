@@ -18,11 +18,11 @@ from scripts.audit_schema_drift import (
     extract_config_tag_assignments,
     extract_tag_policies,
     extract_fgac_policies,
-    rulebook_query_keys,
     build_rulebook,
     is_tag_covered,
     find_uncovered_tags,
     _parse_condition_tag_refs,
+    _applied_tags_sql,
 )
 import scripts.audit_schema_drift as audit_mod
 
@@ -607,7 +607,7 @@ class TestFindUncoveredTags:
 
 
 class TestExtractRulebookConfig:
-    def test_extract_tag_policies_unions_account_and_generated(self, tmp_path):
+    def test_extract_tag_policies_unions_account_and_data_access(self, tmp_path):
         account_dir = tmp_path / "account"
         account_dir.mkdir()
         (account_dir / "abac.auto.tfvars").write_text("""\
@@ -616,9 +616,9 @@ tag_policies = [
 ]
 """)
         env_dir = tmp_path / "dev"
-        gen_dir = env_dir / "generated"
-        gen_dir.mkdir(parents=True)
-        (gen_dir / "abac.auto.tfvars").write_text("""\
+        da_dir = env_dir / "data_access"
+        da_dir.mkdir(parents=True)
+        (da_dir / "abac.auto.tfvars").write_text("""\
 tag_policies = [
   { key = "pci_level", values = ["redacted_cvv"], description = "" },
 ]
@@ -626,6 +626,33 @@ tag_policies = [
         policies = extract_tag_policies(env_dir)
         keys = {p["key"] for p in policies}
         assert keys == {"pii_level", "pci_level"}
+
+    def test_extract_ignores_generated_draft(self, tmp_path):
+        """Coverage is derived from PROMOTED config only — the local generated/
+        draft must be ignored so a dropped rule cannot be masked by the draft."""
+        env_dir = tmp_path / "dev"
+        gen_dir = env_dir / "generated"
+        gen_dir.mkdir(parents=True)
+        (gen_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "draft_only_key", values = ["x"], description = "" },
+]
+fgac_policies = [
+  {
+    name            = "draft_mask"
+    policy_type     = "POLICY_TYPE_COLUMN_MASK"
+    catalog         = "c"
+    to_principals   = ["G"]
+    match_condition = "hasTagValue('draft_only_key', 'x')"
+    match_alias     = "cols"
+    function_name   = "m"
+    function_catalog = "c"
+    function_schema  = "s"
+  },
+]
+""")
+        assert extract_tag_policies(env_dir) == []
+        assert extract_fgac_policies(env_dir) == []
 
     def test_extract_fgac_policies_from_data_access(self, tmp_path):
         env_dir = tmp_path / "dev"
@@ -695,39 +722,17 @@ fgac_policies = [
         assert uncovered[0]["tag_key"] == "class.pii"
 
 
-class TestRulebookQueryKeys:
-    def test_key_only_in_tag_policies_is_queried(self, tmp_path):
-        """A governed key declared in data_access tag_policies but never assigned
-        must still be in the query set (issue 1: assignment-only would miss it)."""
-        env_dir = tmp_path / "dev"
-        da_dir = env_dir / "data_access"
-        da_dir.mkdir(parents=True)
-        (da_dir / "abac.auto.tfvars").write_text("""\
-tag_policies = [
-  { key = "custom_governance_key", values = ["restricted"], description = "" },
-]
-""")
-        keys = rulebook_query_keys(env_dir)
-        assert "custom_governance_key" in keys
-
-    def test_unions_governed_keys_and_all_layer_tag_policy_keys(self, tmp_path):
-        account_dir = tmp_path / "account"
-        account_dir.mkdir()
-        (account_dir / "abac.auto.tfvars").write_text("""\
-tag_policies = [
-  { key = "pii_level", values = ["masked_ssn"], description = "" },
-]
-""")
-        env_dir = tmp_path / "dev"
-        da_dir = env_dir / "data_access"
-        da_dir.mkdir(parents=True)
-        (da_dir / "abac.auto.tfvars").write_text("""\
-tag_policies = [
-  { key = "da_only_key", values = ["x"], description = "" },
-]
-""")
-        keys = set(rulebook_query_keys(env_dir))
-        assert {"pii_level", "da_only_key"} <= keys
+class TestAppliedTagsQuery:
+    def test_query_is_not_restricted_to_known_keys(self):
+        """The applied-tags query must NOT filter tag_name — otherwise a tag whose
+        key was dropped from config could never be fetched (issue 1)."""
+        sql = _applied_tags_sql(["cat.sch.tbl"])
+        assert "system.information_schema.column_tags" in sql
+        # No tag_name restriction of any kind
+        assert "tag_name LIKE" not in sql
+        assert "tag_name IN" not in sql
+        # Still scoped to the managed tables
+        assert "cat.sch.tbl" in sql
 
 
 class TestMainRulebookExit:
@@ -766,7 +771,7 @@ fgac_policies = [
         monkeypatch.setattr(audit_mod, "_get_warehouse_id", lambda env_dir, w: "wh-123")
         monkeypatch.setattr(
             audit_mod, "_query_applied_tags",
-            lambda w, wh, tables, keys: applied,
+            lambda w, wh, tables: applied,
         )
 
     def test_rulebook_drift_exits_1(self, tmp_path, monkeypatch):
@@ -786,3 +791,51 @@ fgac_policies = [
              "column": "ssn", "tag_key": "pii_level", "tag_value": "masked_ssn"},
         ])
         assert audit_mod.main(["--mode", "rulebook"]) == 0
+
+    def test_dropped_rule_orphan_tag_is_flagged(self, tmp_path, monkeypatch):
+        """End-to-end: prod retains a custom governance tag whose key/rule was
+        COMPLETELY removed from promoted config. The promoted config only knows
+        pii_level, but prod still carries `data_residency=eu_only` (a non-class.*
+        key no longer in any policy/mask). The audit must fetch it (unrestricted
+        query) and flag it (exit 1)."""
+        env_dir = self._write_env(tmp_path)
+        monkeypatch.chdir(env_dir)
+        self._mock_seams(monkeypatch, [
+            # a governance tag under a key that no longer exists anywhere in config
+            {"catalog": "prod_cat", "schema": "finance", "table": "customers",
+             "column": "region", "tag_key": "data_residency", "tag_value": "eu_only"},
+        ])
+        assert audit_mod.main(["--mode", "rulebook"]) == 1
+
+    def test_generated_draft_does_not_provide_coverage(self, tmp_path, monkeypatch):
+        """A rule present ONLY in the local generated/ draft (not promoted) must
+        NOT count as coverage: the matching prod tag is still flagged (exit 1)."""
+        env_dir = self._write_env(tmp_path)
+        # Promoted data_access only governs pii_level. Put a mask for a different
+        # key in the generated draft — it must be ignored.
+        gen_dir = env_dir / "generated"
+        gen_dir.mkdir(parents=True)
+        (gen_dir / "abac.auto.tfvars").write_text("""\
+tag_policies = [
+  { key = "draft_key", values = ["secret"], description = "" },
+]
+fgac_policies = [
+  {
+    name            = "draft_mask"
+    policy_type     = "POLICY_TYPE_COLUMN_MASK"
+    catalog         = "prod_cat"
+    to_principals   = ["G"]
+    match_condition = "hasTagValue('draft_key', 'secret')"
+    match_alias     = "cols"
+    function_name   = "m"
+    function_catalog = "prod_cat"
+    function_schema  = "finance"
+  },
+]
+""")
+        monkeypatch.chdir(env_dir)
+        self._mock_seams(monkeypatch, [
+            {"catalog": "prod_cat", "schema": "finance", "table": "customers",
+             "column": "col", "tag_key": "draft_key", "tag_value": "secret"},
+        ])
+        assert audit_mod.main(["--mode", "rulebook"]) == 1

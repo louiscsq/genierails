@@ -58,6 +58,7 @@ from sensitivity_source import (
     SensitivitySource,
     select_findings,
 )
+from treatment_derivation import derive_treatment_model, load_treatment_config
 
 PRODUCT_NAME = "genierails"
 PRODUCT_VERSION = "0.1.0"
@@ -2802,6 +2803,34 @@ def _render_fgac_policy_block(policy: dict) -> str:
         lines.append(f"    {key:<16} = {rendered}")
     lines.append("  }")
     return "\n".join(lines)
+
+
+def derive_enforcement_treatments(tfvars_path: Path) -> int:
+    """Materialize one ``gr.treatment`` value and mask per sensitive column."""
+    try:
+        import hcl2
+        text = tfvars_path.read_text()
+        cfg = hcl2.loads(text)
+    except Exception:
+        return 0
+
+    derived, changes = derive_treatment_model(cfg, load_treatment_config())
+    if not changes:
+        return 0
+    text = _replace_bracket_section(
+        text, "tag_policies",
+        [_render_tag_policy_block(item) for item in derived.get("tag_policies", [])],
+    )
+    text = _replace_bracket_section(
+        text, "tag_assignments",
+        [_render_tag_assignment_block(item) for item in derived.get("tag_assignments", [])],
+    )
+    text = _replace_bracket_section(
+        text, "fgac_policies",
+        [_render_fgac_policy_block(item) for item in derived.get("fgac_policies", [])],
+    )
+    tfvars_path.write_text(text)
+    return changes
 
 
 def _parse_sql_function_names(sql_path: Path | None) -> set[str]:
@@ -7015,6 +7044,11 @@ Before you apply, tune for your business roles, security requirements, and Genie
             if n_acl:
                 print(f"  Auto-fixed: populated acl_groups for {n_acl} genie space(s)")
 
+        if args.mode != "genie":
+            n_treatments = derive_enforcement_treatments(tfvars_path)
+            if n_treatments:
+                print(f"  Derived GenieRails enforcement treatments ({n_treatments} change(s))")
+
         n_fn_canonical = autofix_canonical_function_names(tfvars_path, sql_path if sql_block else None)
         if n_fn_canonical:
             print(f"  Auto-fixed: normalized {n_fn_canonical} function name(s) to canonical forms")
@@ -7241,6 +7275,8 @@ Before you apply, tune for your business roles, security requirements, and Genie
                         autofix_missing_genie_space_entries(tfvars_path, auth_cfg)
                         env_tfvars = tfvars_path.parent.parent / "env.auto.tfvars"
                         autofix_acl_groups(tfvars_path, env_tfvars if env_tfvars.exists() else None)
+                    if args.mode != "genie":
+                        derive_enforcement_treatments(tfvars_path)
                     autofix_canonical_function_names(tfvars_path, sql_path if sql_block else None)
                     autofix_invalid_function_refs(tfvars_path, sql_path if sql_block else None)
                     autofix_fgac_arg_count_mismatch(tfvars_path, sql_path if sql_block else None)

@@ -1,0 +1,146 @@
+"""Derive one GenieRails-owned enforcement treatment per sensitive column."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+CONFIG_PATH = Path(__file__).with_name("treatment_config.json")
+
+
+@dataclass(frozen=True)
+class Treatment:
+    value: str
+    masking_function: str
+    sources: frozenset[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class TreatmentConfig:
+    tag_key: str
+    description: str
+    treatments: tuple[Treatment, ...]
+
+    @property
+    def values(self) -> list[str]:
+        return [item.value for item in self.treatments]
+
+
+def load_treatment_config(path: Path = CONFIG_PATH) -> TreatmentConfig:
+    raw = json.loads(path.read_text())
+    treatments = tuple(
+        Treatment(
+            value=item["value"],
+            masking_function=item["masking_function"],
+            sources=frozenset(tuple(source) for source in item["sources"]),
+        )
+        for item in raw["treatments"]
+    )
+    values = [item.value for item in treatments]
+    sources = [source for item in treatments for source in item.sources]
+    if len(values) != len(set(values)) or len(sources) != len(set(sources)):
+        raise ValueError("Treatment values and source mappings must be unique")
+    return TreatmentConfig(raw["tag_key"], raw["description"], treatments)
+
+
+def resolve_treatment(findings: list[tuple[str, str]], config: TreatmentConfig) -> Treatment | None:
+    """Return the strictest matching treatment; config order is precedence."""
+    observed = set(findings)
+    return next((item for item in config.treatments if item.sources & observed), None)
+
+
+def derive_treatment_model(cfg: dict, config: TreatmentConfig) -> tuple[dict, int]:
+    """Collapse mapped column findings and rebuild masks on ``gr.treatment``.
+
+    Non-column assignments and unmapped governance tags are preserved. All
+    generated column masks are replaced, making the single treatment tag the
+    only route by which a mask can match a column.
+    """
+    assignments = [dict(item) for item in (cfg.get("tag_assignments") or [])]
+    mapped_sources = {source for item in config.treatments for source in item.sources}
+    by_column: dict[str, list[tuple[str, str]]] = {}
+    retained: list[dict] = []
+    for assignment in assignments:
+        source = (assignment.get("tag_key", ""), assignment.get("tag_value", ""))
+        if assignment.get("entity_type") == "columns" and source in mapped_sources:
+            by_column.setdefault(assignment.get("entity_name", ""), []).append(source)
+        else:
+            retained.append(assignment)
+
+    derived: list[dict] = []
+    used: dict[str, Treatment] = {}
+    for column, findings in sorted(by_column.items()):
+        treatment = resolve_treatment(findings, config)
+        if treatment is None:
+            continue
+        used[treatment.value] = treatment
+        derived.append({
+            "entity_type": "columns", "entity_name": column,
+            "tag_key": config.tag_key, "tag_value": treatment.value,
+        })
+
+    tag_policies = [
+        dict(policy) for policy in (cfg.get("tag_policies") or [])
+        if policy.get("key") != config.tag_key
+    ]
+    tag_policies.append({
+        "key": config.tag_key,
+        "description": config.description,
+        "values": config.values,
+    })
+
+    existing_policies = [dict(policy) for policy in (cfg.get("fgac_policies") or [])]
+    column_masks = [p for p in existing_policies if p.get("policy_type") == "POLICY_TYPE_COLUMN_MASK"]
+    other_policies = [p for p in existing_policies if p.get("policy_type") != "POLICY_TYPE_COLUMN_MASK"]
+    template = column_masks[0] if column_masks else {}
+
+    catalogs_by_treatment: dict[str, set[str]] = {}
+    for assignment in derived:
+        parts = assignment["entity_name"].split(".")
+        if len(parts) >= 4:
+            catalogs_by_treatment.setdefault(assignment["tag_value"], set()).add(parts[0])
+
+    new_masks: list[dict] = []
+    for treatment in config.treatments:
+        for catalog in sorted(catalogs_by_treatment.get(treatment.value, set())):
+            policy = {
+                "name": f"gr_mask_{catalog}_{treatment.value}",
+                "policy_type": "POLICY_TYPE_COLUMN_MASK",
+                "catalog": catalog,
+                "to_principals": list(template.get("to_principals") or ["account users"]),
+                "comment": f"GenieRails treatment {treatment.value}; strictest-wins derivation",
+                "match_condition": f"hasTagValue('{config.tag_key}', '{treatment.value}')",
+                "match_alias": f"gr_treatment_{treatment.value}",
+                "function_name": treatment.masking_function,
+                "function_catalog": catalog,
+                "function_schema": template.get("function_schema") or "default",
+            }
+            if template.get("except_principals"):
+                policy["except_principals"] = list(template["except_principals"])
+            new_masks.append(policy)
+
+    result = dict(cfg)
+    result["tag_policies"] = tag_policies
+    result["tag_assignments"] = retained + derived
+    result["fgac_policies"] = other_policies + new_masks
+    changes = len(derived) + len(column_masks) + len(new_masks)
+    return result, changes
+
+
+def matching_masks_by_column(cfg: dict) -> dict[str, list[str]]:
+    """Return matching column-mask names for each assigned treatment column."""
+    import re
+    masks = [p for p in (cfg.get("fgac_policies") or []) if p.get("policy_type") == "POLICY_TYPE_COLUMN_MASK"]
+    result: dict[str, list[str]] = {}
+    for assignment in cfg.get("tag_assignments") or []:
+        if assignment.get("entity_type") != "columns":
+            continue
+        column = assignment.get("entity_name", "")
+        tags = {(assignment.get("tag_key", ""), assignment.get("tag_value", ""))}
+        for policy in masks:
+            refs = set(re.findall(r"hasTagValue\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", policy.get("match_condition", "")))
+            if refs and refs <= tags:
+                result.setdefault(column, []).append(policy.get("name", ""))
+        result.setdefault(column, [])
+    return result

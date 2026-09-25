@@ -27,7 +27,7 @@
 #   - `envs/account/abac.auto.tfvars`
 #       groups + optional group_members
 #   - `envs/<env>/data_access/abac.auto.tfvars`
-#       env-scoped groups lookup + tag_policies + tag_assignments + fgac_policies
+#       env-scoped groups lookup + fgac_policies (rules, not assignment facts)
 #   - `envs/<env>/data_access/masking_functions.sql`
 #       env-scoped masking SQL deployed by the governance layer
 #   - `envs/<env>/abac.auto.tfvars`

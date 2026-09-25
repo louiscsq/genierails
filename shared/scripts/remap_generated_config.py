@@ -24,6 +24,50 @@ import sys
 from pathlib import Path
 
 
+def remove_tag_assignments(text: str) -> str:
+    """Remove the generated top-level tag_assignments list.
+
+    Assignments are environment-specific classification facts. Cross-environment
+    promotion carries governance rules, while the destination classifier derives
+    its own facts from the destination catalog.
+    """
+    match = re.search(r"(?m)^tag_assignments\s*=\s*\[", text)
+    if not match:
+        return text
+
+    opening_bracket = text.find("[", match.start(), match.end())
+    depth = 0
+    in_string = False
+    escaped = False
+    index = opening_bracket
+
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                while end < len(text) and text[end] in " \t":
+                    end += 1
+                if end < len(text) and text[end] == "\n":
+                    end += 1
+                return text[: match.start()] + text[end:]
+        index += 1
+
+    raise ValueError("Unterminated top-level tag_assignments list")
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments, supporting both new flag-based and legacy positional styles."""
     # Detect legacy positional invocation: 6 positional args with no --map flags.
@@ -99,7 +143,7 @@ def remap_hcl(text: str, pairs: list[tuple[str, str]]) -> str:
       (catches references in genie_space_configs where the LLM may use the
       catalog name without a trailing dot, e.g. in comments or descriptions)
     """
-    result = text
+    result = remove_tag_assignments(text)
     for src, dest in pairs:
         # Replace catalog-prefixed table refs (e.g. in entity_name, inline strings).
         result = result.replace(f"{src}.", f"{dest}.")

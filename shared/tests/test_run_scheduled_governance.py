@@ -35,6 +35,74 @@ def test_bad_env_dir_returns_2(monkeypatch, capsys):
     assert "env directory not found" in capsys.readouterr().err
 
 
+def test_gitignored_envs_dir_absent_from_checkout():
+    # Regression guard: the repo's envs/ is .gitignore'd, so a fresh Git checkout
+    # of this branch does NOT contain the env the job scans. Without a config
+    # source the wrapper cannot locate it — hence materialization is required.
+    assert not (REPO_ROOT / "aws" / "envs" / "prod").exists()
+
+
+def test_materialize_env_dir_copies_config_into_checkout(tmp_path):
+    # Simulate a runtime-visible config source (UC Volume / workspace path)...
+    source = tmp_path / "volume_prod"
+    (source / "data_access").mkdir(parents=True)
+    (source / "auth.auto.tfvars").write_text("# auth\n")
+    (source / "env.auto.tfvars").write_text("# env\n")
+    (source / "data_access" / "abac.auto.tfvars").write_text("tag_assignments = [\n]\n")
+
+    # ...and the (initially absent) env dir inside the checkout.
+    env_dir = tmp_path / "checkout" / "aws" / "envs" / "prod"
+    assert not env_dir.exists()
+
+    rsg._materialize_env_dir(str(source), env_dir)
+
+    assert env_dir.is_dir()
+    assert (env_dir / "auth.auto.tfvars").read_text() == "# auth\n"
+    assert (env_dir / "env.auto.tfvars").exists()
+    assert (env_dir / "data_access" / "abac.auto.tfvars").exists()
+
+
+def test_materialize_missing_source_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        rsg._materialize_env_dir(str(tmp_path / "nope"), tmp_path / "env")
+
+
+def test_main_materializes_env_dir_before_running_steps(tmp_path, monkeypatch):
+    # End-to-end: with --config-source, main() materializes the env dir (which
+    # does not exist beforehand) and then runs the steps against it.
+    source = tmp_path / "volume_prod"
+    (source / "data_access").mkdir(parents=True)
+    (source / "data_access" / "abac.auto.tfvars").write_text("tag_assignments = [\n]\n")
+    env_dir = tmp_path / "checkout" / "aws" / "envs" / "prod"
+
+    seen = {}
+
+    def fake_audit(ed):
+        seen["audit_exists"] = ed.is_dir()
+        return 0
+
+    monkeypatch.setattr(rsg, "_audit", fake_audit)
+    monkeypatch.setattr(rsg, "_delta", lambda ed, auth_file, catalog="": 0)
+    monkeypatch.setattr(rsg, "_coverage", lambda ed: 0)
+    monkeypatch.setattr(sys, "argv",
+                        ["prog", "--env-dir", str(env_dir),
+                         "--config-source", str(source), "--step", "all"])
+
+    assert rsg.main() == 0
+    assert env_dir.is_dir()               # materialized
+    assert seen["audit_exists"] is True   # existed before the first step ran
+
+
+def test_main_missing_config_source_and_env_dir_returns_2(tmp_path, monkeypatch, capsys):
+    # Nonexistent config source -> materialize fails -> exit 2 with guidance.
+    env_dir = tmp_path / "checkout" / "aws" / "envs" / "prod"
+    monkeypatch.setattr(sys, "argv",
+                        ["prog", "--env-dir", str(env_dir),
+                         "--config-source", str(tmp_path / "missing"), "--step", "all"])
+    assert rsg.main() == 2
+    assert "config source not found" in capsys.readouterr().err
+
+
 def test_coverage_no_config_fails_loudly(tmp_path, capsys):
     # No config in either layer -> hard failure, never a silent pass.
     assert rsg._coverage(tmp_path) == 1

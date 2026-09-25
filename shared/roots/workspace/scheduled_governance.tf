@@ -61,6 +61,17 @@ variable "scheduled_governance_catalog" {
   description = "Optional catalog threaded to the generate-delta step (generate_abac.py --catalog), e.g. for masking-UDF catalog derivation. Empty = auto-derive from the target env's uc_tables."
 }
 
+variable "scheduled_governance_config_source" {
+  type        = string
+  default     = ""
+  description = "Runtime-visible path the job copies the env config from before scanning (a Unity Catalog Volume like /Volumes/<cat>/<schema>/<vol>/prod, workspace files, or a DBFS mount). Required when enabled: the repo's envs/ is .gitignore'd, so the Git checkout does NOT contain envs/<env>/. The source must hold that env's auth.auto.tfvars, env.auto.tfvars, data_access/ and (optionally) generated/."
+
+  validation {
+    condition     = !var.enable_scheduled_governance || var.scheduled_governance_config_source != ""
+    error_message = "scheduled_governance_config_source must be set when enable_scheduled_governance = true — the Git checkout does not contain the .gitignore'd envs/<env>/ config."
+  }
+}
+
 variable "scheduled_governance_cron" {
   type        = string
   default     = "0 0 6 * * ?"
@@ -147,7 +158,11 @@ resource "databricks_job" "scheduled_governance" {
   name                = local.scheduled_governance_job_name
   max_concurrent_runs = 1
 
-  # Check out this repo so the tasks can invoke the existing entrypoints.
+  # Check out this repo so the tasks can invoke the existing entrypoints. The
+  # checkout provides the CODE only — the repo's envs/ is .gitignore'd, so the
+  # per-env config (auth/env/data_access/generated tfvars) is NOT present. The
+  # wrapper materializes it from scheduled_governance_config_source (a UC Volume
+  # / workspace path) into the env dir before scanning.
   git_source {
     url      = var.scheduled_governance_git_url
     provider = var.scheduled_governance_git_provider
@@ -184,6 +199,7 @@ resource "databricks_job" "scheduled_governance" {
       parameters = concat(
         ["--env-dir", local.scheduled_governance_env_dir, "--step", "all"],
         var.scheduled_governance_catalog != "" ? ["--catalog", var.scheduled_governance_catalog] : [],
+        var.scheduled_governance_config_source != "" ? ["--config-source", var.scheduled_governance_config_source] : [],
       )
     }
   }

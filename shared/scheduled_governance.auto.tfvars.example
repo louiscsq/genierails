@@ -25,11 +25,19 @@ scheduled_governance_catalog = "prod_fin"
 scheduled_governance_cron     = "0 0 6 * * ?"
 scheduled_governance_timezone = "UTC"
 
-# Repo the job checks out to run the existing steady-state entrypoints.
-# Required when enable_scheduled_governance = true.
+# Repo the job checks out to run the existing steady-state entrypoints. The
+# checkout provides CODE only. Required when enable_scheduled_governance = true.
 scheduled_governance_git_url      = "https://github.com/<org>/<repo>"
 scheduled_governance_git_branch   = "main"
 scheduled_governance_git_provider = "gitHub" # gitHub | gitLab | bitbucketCloud | azureDevOpsServices | ...
+
+# Where the job reads the env config from at runtime. REQUIRED when enabled:
+# the repo's envs/ is .gitignore'd, so the checkout does NOT contain
+# envs/<env>/. Point this at a runtime-visible path (a Unity Catalog Volume,
+# workspace files, or a DBFS mount) holding this env's auth.auto.tfvars,
+# env.auto.tfvars, data_access/ and (optionally) generated/. The wrapper copies
+# it into the checkout's env dir before scanning.
+scheduled_governance_config_source = "/Volumes/main/governance/genierails/prod"
 
 # Optional: who to email when the job fails (e.g. drift found but not resolved).
 scheduled_governance_notification_emails = ["governance-team@example.com"]

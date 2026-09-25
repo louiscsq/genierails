@@ -29,6 +29,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +48,27 @@ def _resolve_env_dir(env_dir_arg: str) -> Path:
     if not p.is_absolute():
         p = (REPO_ROOT / p).resolve()
     return p
+
+
+def _materialize_env_dir(config_source: str, env_dir: Path) -> None:
+    """Copy the env configuration from a runtime-visible source into env_dir.
+
+    The repo's `envs/` directories are .gitignore'd (they hold per-deployment
+    config + secrets), so a Git checkout of this repo does NOT contain
+    envs/<env>/. When the job runs from a fresh checkout, the operator points it
+    at a path the job runtime can see — a Unity Catalog Volume, workspace files,
+    or DBFS mount holding auth.auto.tfvars, env.auto.tfvars, data_access/,
+    generated/, etc. — and we copy that tree into env_dir before scanning.
+
+    Overlays onto env_dir if it already exists (source wins).
+    """
+    src = Path(config_source)
+    if not src.is_dir():
+        raise FileNotFoundError(
+            f"config source not found or not a directory: {src}")
+    env_dir.mkdir(parents=True, exist_ok=True)
+    print(f"+ materialize env config: {src} -> {env_dir}", flush=True)
+    shutil.copytree(src, env_dir, dirs_exist_ok=True, symlinks=True)
 
 
 def _run(cmd: list[str], cwd: Path) -> int:
@@ -114,11 +136,26 @@ def main() -> int:
     parser.add_argument("--catalog", default="",
                         help="Optional catalog threaded to generate_abac.py --delta (--catalog). "
                              "Empty = auto-derive from the env's uc_tables.")
+    parser.add_argument("--config-source", default="",
+                        help="Runtime-visible path (UC Volume / workspace files / DBFS mount) holding "
+                             "the env config to copy into --env-dir before scanning. Required when the "
+                             "Git checkout does not already contain the env dir (envs/ is .gitignore'd).")
     args = parser.parse_args()
 
     env_dir = _resolve_env_dir(args.env_dir)
+
+    if args.config_source:
+        try:
+            _materialize_env_dir(args.config_source, env_dir)
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
     if not env_dir.is_dir():
-        print(f"ERROR: env directory not found: {env_dir}", file=sys.stderr)
+        print(f"ERROR: env directory not found: {env_dir}\n"
+              f"       The repo's envs/ is .gitignore'd, so a Git-checked-out job will not\n"
+              f"       contain it. Pass --config-source <volume/workspace path> to materialize\n"
+              f"       the env config at runtime.", file=sys.stderr)
         return 2
 
     steps = STEPS if args.step == "all" else (args.step,)

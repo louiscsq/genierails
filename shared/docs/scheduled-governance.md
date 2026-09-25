@@ -33,6 +33,30 @@ loudly (never a silent pass) if no ABAC config exists to validate.
 > the regenerated file. Running them in one process keeps them on one working
 > tree.
 
+## Where the env config comes from (required)
+
+The Git checkout provides the **code** only. The repo's `envs/` directories are
+`.gitignore`'d — they hold per-deployment config and secrets — so a fresh
+checkout does **not** contain `envs/<env>/`, and the scan has nothing to run
+against.
+
+You therefore point the job at a **runtime-visible config source** via
+`scheduled_governance_config_source`: a Unity Catalog Volume (e.g.
+`/Volumes/main/governance/genierails/prod`), workspace files, or a DBFS mount
+holding that env's `auth.auto.tfvars`, `env.auto.tfvars`, `data_access/` and
+(optionally) `generated/`. Before the scan, the wrapper copies that tree into
+the checkout's env dir. This variable is **required when
+`enable_scheduled_governance = true`** (enforced by a Terraform variable
+validation), and the wrapper exits with clear guidance if the env config is
+still missing at runtime.
+
+Populate the source once from the machine that runs `make apply` (which already
+has the env dir), for example:
+
+```bash
+databricks fs cp -r aws/envs/prod dbfs:/Volumes/main/governance/genierails/prod
+```
+
 ## Disabled by default
 
 The job is defined in
@@ -55,6 +79,8 @@ the `databricks_job` resource has `count = 0` until you opt in.
    scheduled_governance_catalog = "prod_fin"     # optional; empty = auto-derive
    scheduled_governance_cron    = "0 0 6 * * ?"  # daily 06:00
    scheduled_governance_git_url = "https://github.com/<org>/<repo>"
+   # Required: runtime-visible path holding the env config (envs/ is gitignored).
+   scheduled_governance_config_source = "/Volumes/main/governance/genierails/prod"
    scheduled_governance_notification_emails = ["governance-team@example.com"]
    ```
 
@@ -82,7 +108,8 @@ the `databricks_job` resource has `count = 0` until you opt in.
 | `scheduled_governance_catalog` | `""` | Optional catalog threaded to `generate_abac.py --delta` (masking-UDF catalog derivation). Empty = auto-derive from the env's `uc_tables`. |
 | `scheduled_governance_cron` | `"0 0 6 * * ?"` | Quartz cron cadence (daily 06:00). |
 | `scheduled_governance_timezone` | `"UTC"` | Timezone the cron is evaluated in. |
-| `scheduled_governance_git_url` | `""` | Repo the job checks out. **Required when enabled.** |
+| `scheduled_governance_git_url` | `""` | Repo the job checks out (code only). **Required when enabled.** |
+| `scheduled_governance_config_source` | `""` | Runtime-visible path (UC Volume / workspace / DBFS) holding the env config; materialized into the checkout before scanning. **Required when enabled** (`envs/` is gitignored). |
 | `scheduled_governance_git_branch` | `"main"` | Branch to check out. |
 | `scheduled_governance_git_provider` | `"gitHub"` | Git provider for the Jobs Git source. |
 | `scheduled_governance_serverless_client` | `"2"` | Serverless environment client version. |

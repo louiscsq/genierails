@@ -238,7 +238,7 @@ def main() -> None:
         args.out_sql.write_text(remapped_sql)
         print(f"  Wrote remapped masking SQL:      {args.out_sql}")
     else:
-        print("  Skipped masking SQL (not present in source — genie mode)")
+        print(f"  Skipped masking SQL (not present in source — genie mode)")
 
 
 if __name__ == "__main__":

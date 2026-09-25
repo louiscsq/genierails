@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from split_abac_config import build_account_config, build_data_access_config
 
 
-def test_split_promotes_rules_but_not_tag_assignment_facts():
+def test_same_environment_split_keeps_tag_assignments():
     generated = {
         "groups": {"analysts": {"description": "Data analysts"}},
         "tag_policies": [{"key": "sensitivity", "values": ["pii"]}],
@@ -30,4 +30,4 @@ def test_split_promotes_rules_but_not_tag_assignment_facts():
     assert account["tag_policies"][0]["values"] == ["pii"]
     assert data_access["fgac_policies"] == generated["fgac_policies"]
     assert data_access["groups"] == generated["groups"]
-    assert "tag_assignments" not in data_access
+    assert data_access["tag_assignments"] == generated["tag_assignments"]

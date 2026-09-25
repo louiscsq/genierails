@@ -1004,3 +1004,26 @@ After manually cleaning up, remove the stale state file so subsequent runs start
 ```bash
 rm -f scripts/.test_env_state.json
 ```
+
+---
+
+## Effective-Access Verification (post-apply)
+
+The scenarios above (and `setup_test_data.py --verify`) confirm that governance
+objects — tags, masks, row-filter policies — **exist** after `make apply`. They
+do not confirm those policies actually **take effect** for a querying principal.
+
+To verify by effect, run `make verify-access` after applying an environment. It
+provisions a dedicated service principal per access tier, runs the same query as
+each, and asserts that a lower-tier principal sees the masked value while a
+higher-tier principal sees the raw value (and that row filters restrict rows):
+
+```bash
+make verify-access ENV=dev VERIFY_KEY_COLUMN=customer_id
+```
+
+The value-comparison logic ships with pure unit tests
+(`tests/test_verify_effective_access.py`, in the standard `make test-unit`
+gate); the live workspace calls are guarded behind `GENIERAILS_LIVE_VERIFY=1`.
+See [Effective-Access Verification](effective-access-verification.md) for the
+per-tier test-principal mechanism, options, and the explicit-spec format.

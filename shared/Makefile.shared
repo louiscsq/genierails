@@ -1,4 +1,4 @@
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -530,6 +530,34 @@ _PROVISION       := python3 "$(SHARED_ROOT)/scripts/provision_test_env.py"
 
 test-unit: ## Run fast unit tests (no Databricks/LLM/Terraform required) — use before integration tests
 	cd "$(SHARED_ROOT)" && python3 -m pytest tests/ -v --tb=short
+
+# ── Effective-access verification (roadmap #5) ─────────────────
+# Verify masking / row filters take EFFECT by querying governed tables as a
+# dedicated per-tier test service principal and comparing the values each tier
+# gets back (lower tier masked, higher tier raw; row filters restrict rows).
+# See docs/effective-access-verification.md.
+#
+# Options:
+#   ENV=<env>              workspace env whose data_access config to verify (default: dev)
+#   VERIFY_KEY_COLUMN=<c>  primary-key column used to pair rows across principals
+#   VERIFY_SPEC=<file>     explicit JSON spec (overrides --from-tfvars derivation)
+#   WAREHOUSE_ID=<id>      pin a specific SQL warehouse
+#   KEEP_PRINCIPALS=1      leave the provisioned test principals in place (debug)
+VERIFY_KEY_COLUMN ?=
+VERIFY_SPEC ?=
+_VERIFY_SPEC_FLAG = $(if $(VERIFY_SPEC),--spec "$(VERIFY_SPEC)",--from-tfvars "$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars")
+_VERIFY_WH_FLAG   = $(if $(WAREHOUSE_ID),--warehouse-id $(WAREHOUSE_ID),)
+_VERIFY_KEY_FLAG  = $(if $(VERIFY_KEY_COLUMN),--key-column "$(VERIFY_KEY_COLUMN)",)
+_VERIFY_KEEP_FLAG = $(if $(KEEP_PRINCIPALS),--keep-principals,)
+
+verify-access-spec: _bootstrap _guard-workspace-target ## Print the derived effective-access checks (no workspace/cluster needed)
+	cd "$(SHARED_ROOT)" && python3 verify_effective_access.py \
+		$(_VERIFY_SPEC_FLAG) $(_VERIFY_KEY_FLAG) --print-spec
+
+verify-access: _bootstrap _guard-workspace-target ## Verify masking/row-filters take effect via per-tier test principals (LIVE workspace)
+	cd "$(SHARED_ROOT)" && GENIERAILS_LIVE_VERIFY=1 python3 verify_effective_access.py \
+		$(_VERIFY_SPEC_FLAG) $(_VERIFY_KEY_FLAG) $(_VERIFY_WH_FLAG) $(_VERIFY_KEEP_FLAG) \
+		--auth-file "$(ENV_DIR)/auth.auto.tfvars" --live
 
 test-quickstart: _bootstrap _guard-workspace-target ## Scenario: single space, single catalog (quickstart flow)
 	cd "$(CLOUD_ROOT)" && $(_ITEST_RUNNER) \

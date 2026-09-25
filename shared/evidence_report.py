@@ -156,7 +156,7 @@ def configured_tags(env_dir: Path) -> list[dict[str, str]]:
             parts = str(item.get("entity_name", "")).split(".")
             if item.get("entity_type") == "columns" and len(parts) == 4:
                 row = dict(zip(("catalog", "schema", "table", "column"), parts))
-                row.update(name=str(item.get("tag_name", "")), value=str(item.get("tag_value", "")))
+                row.update(name=str(item.get("tag_key", "")), value=str(item.get("tag_value", "")))
                 rows.append(row)
     return rows
 

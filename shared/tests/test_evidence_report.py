@@ -56,7 +56,7 @@ def test_cli_stays_offline_unless_integration_flag_is_set(tmp_path, monkeypatch)
 tag_assignments = [{
   entity_type = "columns"
   entity_name = "main.sales.customers.email"
-  tag_name = "pii"
+  tag_key = "pii_level"
   tag_value = "email"
 }]
 ''')
@@ -68,7 +68,7 @@ tag_assignments = [{
     assert main(["--env-dir", str(env_dir)], collector=forbidden_collector) == 0
     artifact = json.loads((env_dir / "generated/evidence/compliance-evidence-v1.0.json").read_text())
     assert artifact["header"]["source"] == "offline-config"
-    assert artifact["evidence"][0]["detected_tags"] == [{"name": "pii", "value": "email"}]
+    assert artifact["evidence"][0]["detected_tags"] == [{"name": "pii_level", "value": "email"}]
 
 
 def test_configured_tables_includes_all_genie_tables_and_governance_fallback(tmp_path):
@@ -78,7 +78,7 @@ uc_tables = ["main.sales.orders"]
 genie_spaces = [{ name = "support", uc_tables = ["main.support.tickets"] }]
 ''')
     (tmp_path / "data_access" / "abac.auto.tfvars").write_text('''
-tag_assignments = [{ entity_type = "columns", entity_name = "main.hr.people.ssn", tag_name = "pii", tag_value = "ssn" }]
+tag_assignments = [{ entity_type = "columns", entity_name = "main.hr.people.ssn", tag_key = "sensitivity", tag_value = "ssn" }]
 ''')
     assert configured_tables(tmp_path) == [
         "main.hr.people", "main.sales.orders", "main.support.tickets"

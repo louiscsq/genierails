@@ -201,6 +201,68 @@ def _entity_table_name(entity_type: str, entity_name: str) -> str:
     return ""
 
 
+def validate_policy_overlaps(cfg: dict, result: ValidationResult):
+    """Fail when multiple FGAC policies resolve for one securable object."""
+    assignments = cfg.get("tag_assignments", [])
+    policies = cfg.get("fgac_policies", [])
+    if not isinstance(assignments, list) or not isinstance(policies, list):
+        return
+
+    entity_tags: dict[tuple[str, str], dict[str, set[str]]] = {}
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            continue
+        entity_type = assignment.get("entity_type", "")
+        entity_name = assignment.get("entity_name", "")
+        tag_key = assignment.get("tag_key", "")
+        tag_value = assignment.get("tag_value", "")
+        if entity_type and entity_name and tag_key and tag_value:
+            tags = entity_tags.setdefault((entity_type, entity_name), {})
+            tags.setdefault(tag_key, set()).add(tag_value)
+
+    def catalog_matches(policy: dict, entity_name: str) -> bool:
+        policy_catalog = policy.get("catalog", "") or policy.get("function_catalog", "")
+        entity_catalog = entity_name.split(".")[0] if entity_name else ""
+        return not policy_catalog or not entity_catalog or policy_catalog == entity_catalog
+
+    for (entity_type, entity_name), tags in sorted(entity_tags.items()):
+        if entity_type == "columns":
+            table_name = _entity_table_name(entity_type, entity_name)
+            table_tags = entity_tags.get(("tables", table_name), {})
+            matches = [
+                policy.get("name", "<unnamed>")
+                for policy in policies
+                if isinstance(policy, dict)
+                and policy.get("policy_type") == "POLICY_TYPE_COLUMN_MASK"
+                and catalog_matches(policy, entity_name)
+                and _condition_matches_tags(policy.get("match_condition", ""), tags)
+                and _condition_matches_tags(policy.get("when_condition", ""), table_tags)
+            ]
+            if len(set(matches)) > 1:
+                result.error(
+                    f"Column '{entity_name}' matches multiple column-mask policies: "
+                    f"{sorted(set(matches))}. Unity Catalog allows only one mask to "
+                    f"resolve per column; otherwise apply fails with MULTIPLE_MASKS. "
+                    f"Make these policies' tag conditions mutually exclusive."
+                )
+
+        elif entity_type == "tables":
+            matches = [
+                policy.get("name", "<unnamed>")
+                for policy in policies
+                if isinstance(policy, dict)
+                and policy.get("policy_type") == "POLICY_TYPE_ROW_FILTER"
+                and catalog_matches(policy, entity_name)
+                and _condition_matches_tags(policy.get("when_condition", ""), tags)
+            ]
+            if len(set(matches)) > 1:
+                result.error(
+                    f"Table '{entity_name}' matches multiple row-filter policies: "
+                    f"{sorted(set(matches))}. Unity Catalog allows only one row filter "
+                    f"to resolve per table. Make these policies' tag conditions mutually exclusive."
+                )
+
+
 def _value_requires_coverage(tag_value: str) -> bool:
     return tag_value.strip().lower() not in {"public", "general", "exact"}
 
@@ -658,6 +720,8 @@ def validate_fgac_policies(
                 f"tag_assignments[{i}]: non-public tag '{ta.get('tag_key')}={tval}' on "
                 f"'{ta.get('entity_name')}' is not covered by any active fgac_policy"
             )
+
+    validate_policy_overlaps(cfg, result)
 
     # Detect unsafe tag/function mismatches, especially heterogeneous contact collapse.
     assignments_by_tag: dict[tuple[str, str], list[dict]] = {}

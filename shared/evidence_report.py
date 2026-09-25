@@ -208,6 +208,10 @@ def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehou
     mask_rows = query("SELECT catalog_name, schema_name, table_name, column_name, concat(mask_catalog, '.', mask_schema, '.', mask_name) FROM system.information_schema.column_masks WHERE concat(catalog_name, '.', schema_name, '.', table_name, '.', column_name) IN (" + keys + ")")
     grant_rows = query("SELECT table_catalog, table_schema, table_name, column_name, grantee, privilege_type FROM system.information_schema.column_privileges WHERE " + predicate)
     table_grant_rows = query("SELECT table_catalog, table_schema, table_name, grantee, privilege_type FROM system.information_schema.table_privileges WHERE concat(table_catalog, '.', table_schema, '.', table_name) IN (" + table_key_sql + ")")
+    schema_keys = sorted({".".join(key.split(".")[:2]) for key in tables})
+    catalog_keys = sorted({key.split(".")[0] for key in tables})
+    schema_grant_rows = query("SELECT catalog_name, schema_name, grantee, privilege_type FROM system.information_schema.schema_privileges WHERE concat(catalog_name, '.', schema_name) IN (" + ", ".join(_sql_literal(key) for key in schema_keys) + ")")
+    catalog_grant_rows = query("SELECT catalog_name, grantee, privilege_type FROM system.information_schema.catalog_privileges WHERE catalog_name IN (" + ", ".join(_sql_literal(key) for key in catalog_keys) + ")")
     policy_rows = query("SELECT catalog_name, schema_name, table_name, concat(filter_catalog, '.', filter_schema, '.', filter_name) FROM system.information_schema.row_filters WHERE concat(catalog_name, '.', schema_name, '.', table_name) IN (" + table_key_sql + ")")
 
     base = lambda row: dict(zip(("catalog", "schema", "table", "column"), row[:4]))
@@ -227,13 +231,27 @@ def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehou
     for row in table_grant_rows:
         for column in by_table[".".join(str(value) for value in row[:3])]:
             result["grants"].append({**column, "principal": row[3], "privilege": row[4], "scope": "TABLE"})
+    for row in schema_grant_rows:
+        prefix = ".".join(str(value) for value in row[:2]) + "."
+        for table, table_columns in by_table.items():
+            if table.startswith(prefix):
+                for column in table_columns:
+                    result["grants"].append({**column, "principal": row[2], "privilege": row[3], "scope": "SCHEMA"})
+    for row in catalog_grant_rows:
+        prefix = str(row[0]) + "."
+        for table, table_columns in by_table.items():
+            if table.startswith(prefix):
+                for column in table_columns:
+                    result["grants"].append({**column, "principal": row[1], "privilege": row[2], "scope": "CATALOG"})
     for row in policy_rows:
         for column in by_table[".".join(str(value) for value in row[:3])]:
             result["policies"].append({**column, "name": row[3]})
     try:
         class_rows = query("SELECT catalog_name, schema_name, table_name, column_name, class_tag, latest_detected_time FROM system.data_classification.results WHERE concat(catalog_name, '.', schema_name, '.', table_name, '.', column_name) IN (" + keys + ")")
+        classification_available = True
     except Exception:
-        class_rows = []  # Table is preview/region-dependent; preserve an explicit unknown below.
+        class_rows = []
+        classification_available = False
     detected = set()
     for row in class_rows:
         column = base(row)
@@ -242,7 +260,8 @@ def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehou
         result["tags"].append({**column, "name": "data_classification", "value": row[4]})
     for column in result["columns"]:
         if _fqn(column) not in detected:
-            result["classifications"].append({**column, "status": "no_detection_record", "scanned_at": None})
+            status = "no_detection_record" if classification_available else "unavailable"
+            result["classifications"].append({**column, "status": status, "scanned_at": None})
     return result
 
 

@@ -50,6 +50,14 @@ import time
 from pathlib import Path
 
 from tag_vocabulary import REGISTRY
+from sensitivity_source import (
+    ClassificationSource,
+    Finding,
+    LLMSource,
+    LLM as _SRC_LLM,
+    SensitivitySource,
+    select_findings,
+)
 
 PRODUCT_NAME = "genierails"
 PRODUCT_VERSION = "0.1.0"
@@ -1659,6 +1667,76 @@ def _fetch_live_tag_policy_values() -> dict[str, set[str]]:
     except Exception as exc:
         print(f"  [AUTOFIX] Could not fetch live tag policies ({exc}); using file-only values")
         return {}
+
+
+def _fetch_live_classification_source(
+    table_refs: list[str] | None,
+    auth_cfg: dict,
+) -> SensitivitySource | None:
+    """Best-effort: build a ClassificationSource from native UC Data Classification.
+
+    Queries ``system.information_schema.column_tags`` (``class.*`` namespace) —
+    and ``system.data_classification.results`` when present — through a SQL
+    warehouse, using the same statement-execution pattern as
+    scripts/audit_schema_drift.py.
+
+    Returns ``None`` on any failure or when no native classification exists (no
+    warehouse, no credentials, table absent, empty results) so generation
+    proceeds on the DDL-inference path exactly as before.  This is the hook that
+    makes ClassificationSource the default sensitivity input whenever native
+    ``class.*`` tags are available, while keeping behaviour unchanged when they
+    are not.
+    """
+    table_fqns = [
+        r for r in (table_refs or [])
+        if len(str(r).split(".")) == 3 and "*" not in str(r)
+    ]
+    if not table_fqns:
+        return None
+    try:
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.sql import StatementState
+
+        configure_databricks_env(auth_cfg)
+        w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+
+        warehouse_id = str(auth_cfg.get("sql_warehouse_id") or "").strip()
+        if not warehouse_id:
+            for wh in w.warehouses.list():
+                if wh.id:
+                    warehouse_id = wh.id
+                    break
+        if not warehouse_id:
+            print("  [SENSITIVITY] No SQL warehouse available; using DDL inference only")
+            return None
+
+        def _run_sql(sql: str) -> list:
+            r = w.statement_execution.execute_statement(
+                statement=sql, warehouse_id=warehouse_id, wait_timeout="50s",
+            )
+            while r.status and r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+                time.sleep(2)
+                r = w.statement_execution.get_statement(r.statement_id)
+            if r.status and r.status.state == StatementState.FAILED:
+                err = getattr(r.status, "error", None)
+                msg = getattr(err, "message", str(err)) if err else "unknown"
+                raise RuntimeError(msg)
+            if r.result and r.result.data_array:
+                return r.result.data_array
+            return []
+
+        source = ClassificationSource.from_run_sql(_run_sql, table_fqns)
+        if not source.has_native_data():
+            return None
+        print(
+            "  [SENSITIVITY] Native UC Data Classification found for "
+            f"{len(source.classified_columns())} column(s) (class.* tags) — "
+            "using as authoritative sensitivity source"
+        )
+        return source
+    except Exception as exc:
+        print(f"  [SENSITIVITY] Could not read native classification ({exc}); using DDL inference only")
+        return None
 
 
 def autofix_tag_policies(tfvars_path: Path) -> int:
@@ -5054,6 +5132,7 @@ def autofix_untagged_pii_columns(
     tfvars_path: Path,
     ddl_path: Path | None = None,
     sql_path: Path | None = None,
+    classification_source: SensitivitySource | None = None,
 ) -> int:
     """Detect PII/sensitive columns in the DDL that the LLM forgot to tag.
 
@@ -5061,6 +5140,15 @@ def autofix_untagged_pii_columns(
     adds tag_assignment entries for any that are missing.  This prevents the
     common failure where the LLM generates groups and policies but omits
     tag assignments for obvious columns like email, phone, or address.
+
+    Sensitivity per column is resolved through the :class:`SensitivitySource`
+    interface: when ``classification_source`` supplies native UC Data
+    Classification (``class.*``) findings for a column, those are authoritative;
+    otherwise the deterministic DDL name-pattern inference (the LLM path's
+    backstop, wrapped as :class:`LLMSource`) decides.  Every added assignment is
+    logged with the source that produced it.  When ``classification_source`` is
+    ``None`` (the default), the result is identical to the legacy name-pattern
+    behaviour.
 
     Returns the number of tag assignments added.
     """
@@ -5146,23 +5234,36 @@ def autofix_untagged_pii_columns(
     if "mask_amount_rounded" in available_fns:
         active_patterns.extend(_FINANCIAL_COLUMN_TAG_MAP)
 
-    # Check each column against PII patterns
-    new_assignments: list[dict] = []
-    for full_name, col_name in all_columns:
-        if full_name in existing_tags:
-            continue
-        for hints, tag_key, tag_value in active_patterns:
-            if col_name in hints or any(h in col_name for h in hints):
-                new_assignments.append({
-                    "entity_type": "columns",
-                    "entity_name": full_name,
-                    "tag_key": tag_key,
-                    "tag_value": tag_value,
-                })
-                break  # first match wins
+    # Resolve each untagged column's sensitivity through the SensitivitySource
+    # interface.  The deterministic DDL name-pattern matcher below is the LLM
+    # path's backstop, wrapped as an LLMSource; native classification (when
+    # supplied) takes precedence per column via select_findings.
+    col_name_by_full = dict(all_columns)
+    candidate_columns = [full for full, _ in all_columns if full not in existing_tags]
 
-    if not new_assignments:
+    def _ddl_pattern_infer(cols: list[str]) -> list[Finding]:
+        out: list[Finding] = []
+        for full_name in cols:
+            col_name = col_name_by_full.get(full_name, full_name.split(".")[-1].lower())
+            for hints, tag_key, tag_value in active_patterns:
+                if col_name in hints or any(h in col_name for h in hints):
+                    out.append(Finding(
+                        entity_name=full_name,
+                        tag_key=tag_key,
+                        tag_value=tag_value,
+                        source=_SRC_LLM,
+                        detail=col_name,
+                    ))
+                    break  # first match wins
+        return out
+
+    llm_source = LLMSource(_ddl_pattern_infer)
+    findings = select_findings(candidate_columns, classification_source, llm_source)
+
+    if not findings:
         return 0
+
+    new_assignments: list[dict] = [f.as_assignment() for f in findings]
 
     # Inject new tag assignments into the HCL text
     # Find the tag_assignments section and append before the closing ]
@@ -5183,17 +5284,20 @@ def autofix_untagged_pii_columns(
         insert_pos = ta_section.end(2)
 
     lines = []
-    for ta in new_assignments:
+    for f in findings:
         lines.append(
-            f'  {{ entity_type = "columns", entity_name = "{ta["entity_name"]}", '
-            f'tag_key = "{ta["tag_key"]}", tag_value = "{ta["tag_value"]}" }},'
+            f'  {{ entity_type = "columns", entity_name = "{f.entity_name}", '
+            f'tag_key = "{f.tag_key}", tag_value = "{f.tag_value}" }},'
         )
-        print(f"  [AUTOFIX] Added tag_assignment: {ta['entity_name']} ({ta['tag_key']} = '{ta['tag_value']}')")
+        print(
+            f"  [AUTOFIX] Added tag_assignment: {f.entity_name} "
+            f"({f.tag_key} = '{f.tag_value}') [source: {f.source}]"
+        )
 
     injection = "\n" + "\n".join(lines) + "\n"
     text = text[:insert_pos] + injection + text[insert_pos:]
     tfvars_path.write_text(text)
-    return len(new_assignments)
+    return len(findings)
 
 
 def autofix_remove_uncovered_tags(tfvars_path: Path, sql_path: Path | None = None) -> int:
@@ -6822,12 +6926,21 @@ Before you apply, tune for your business roles, security requirements, and Genie
         if n_overlay_fns:
             print(f"  Auto-fixed: injected {n_overlay_fns} overlay-provided masking function(s)")
 
+        # Resolve the sensitivity source once: native UC Data Classification
+        # (class.* tags) is authoritative when present, else DDL inference.
+        # Best-effort — None means "no native classification, behave as before".
+        classification_source = (
+            _fetch_live_classification_source(table_refs, auth_cfg)
+            if args.mode != "genie" else None
+        )
+
         # Skip PII autofix in genie mode — tag_assignments are managed by the governance team
         if args.mode != "genie":
             n_pii_tags = autofix_untagged_pii_columns(
                 tfvars_path,
                 ddl_path=out_dir / "ddl" / "_fetched.sql" if out_dir else None,
                 sql_path=sql_path if sql_block else None,
+                classification_source=classification_source,
             )
             if n_pii_tags:
                 print(f"  Auto-fixed: added {n_pii_tags} tag_assignment(s) for untagged PII columns")
@@ -7087,6 +7200,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                             tfvars_path,
                             ddl_path=out_dir / "ddl" / "_fetched.sql" if out_dir else None,
                             sql_path=sql_path if sql_block else None,
+                            classification_source=classification_source,
                         )
                         autofix_tag_policies(tfvars_path)  # register new PII tag values
                     autofix_missing_fgac_policies(tfvars_path, sql_path if sql_block else None)

@@ -132,22 +132,33 @@ class VerificationSpec:
 # ---------------------------------------------------------------------------
 # Result types (pure)
 # ---------------------------------------------------------------------------
+# A verification gate must never report success for something it did not
+# actually prove. There are therefore only two passing outcomes — PASS — and
+# every non-conclusive outcome (INCONCLUSIVE) is treated as a failure that makes
+# the CLI exit non-zero, exactly like a proven violation (FAIL). INCONCLUSIVE is
+# kept distinct from FAIL only so the operator can tell "we couldn't verify"
+# (usually a test-data / permissions problem) apart from "we proved a leak"
+# (a real governance bug); both block the gate.
 PASS = "PASS"
-FAIL = "FAIL"
-SKIP = "SKIP"
+FAIL = "FAIL"            # verification proved the policy did NOT take effect
+INCONCLUSIVE = "INCONCLUSIVE"  # could not be conclusively verified — NOT a pass
+
+# Every status that is not PASS blocks the gate.
+NON_PASSING = (FAIL, INCONCLUSIVE)
 
 
 @dataclass
 class CheckResult:
     kind: str            # "column-mask" | "row-filter"
     target: str          # human description of what was checked
-    status: str          # PASS | FAIL | SKIP
+    status: str          # PASS | FAIL | INCONCLUSIVE
     detail: str          # human-readable explanation
     evidence: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
-        return self.status in (PASS, SKIP)
+        # ONLY a proven PASS counts as success. Inconclusive never passes.
+        return self.status == PASS
 
 
 @dataclass
@@ -159,14 +170,16 @@ class EffectiveAccessReport:
 
     @property
     def passed(self) -> bool:
-        return all(r.ok for r in self.results)
+        # An empty report proves nothing, so it does not pass either.
+        return bool(self.results) and all(r.ok for r in self.results)
 
     @property
     def failures(self) -> list[CheckResult]:
-        return [r for r in self.results if r.status == FAIL]
+        """Every non-passing result (proven failures AND inconclusive checks)."""
+        return [r for r in self.results if r.status in NON_PASSING]
 
     def counts(self) -> dict[str, int]:
-        c = {PASS: 0, FAIL: 0, SKIP: 0}
+        c = {PASS: 0, FAIL: 0, INCONCLUSIVE: 0}
         for r in self.results:
             c[r.status] = c.get(r.status, 0) + 1
         return c
@@ -178,17 +191,23 @@ class EffectiveAccessReport:
             "  Effective-Access Verification",
             "=" * 60,
         ]
+        if not self.results:
+            lines.append("  ✗ [INCONCLUSIVE] no checks were run — nothing was verified")
         for r in self.results:
-            marker = {PASS: "✓", FAIL: "✗", SKIP: "•"}.get(r.status, "?")
+            marker = {PASS: "✓", FAIL: "✗", INCONCLUSIVE: "✗"}.get(r.status, "?")
             lines.append(f"  {marker} [{r.status}] {r.target}")
             if r.status != PASS:
                 lines.append(f"        {r.detail}")
         lines.append("-" * 60)
         total = sum(c.values())
-        if c[FAIL] == 0:
-            lines.append(f"  RESULT: ALL EFFECTIVE ({c[PASS]} passed, {c[SKIP]} skipped / {total})")
+        blocking = c[FAIL] + c[INCONCLUSIVE]
+        if self.passed:
+            lines.append(f"  RESULT: ALL EFFECTIVE ({c[PASS]} passed / {total})")
         else:
-            lines.append(f"  RESULT: {c[FAIL]} FAILED ({c[PASS]} passed, {c[SKIP]} skipped / {total})")
+            lines.append(
+                f"  RESULT: NOT VERIFIED — {blocking} blocking "
+                f"({c[FAIL]} failed, {c[INCONCLUSIVE]} inconclusive, {c[PASS]} passed / {total})"
+            )
         lines.append("=" * 60)
         return "\n".join(lines)
 
@@ -378,54 +397,115 @@ def _normalize_value(v: Any) -> Any:
     return str(v).strip()
 
 
+def _errors_for(
+    principals: Iterable[str], errors_by_principal: Optional[Mapping[str, str]],
+) -> dict[str, str]:
+    """Return the query errors recorded for any of ``principals``."""
+    if not errors_by_principal:
+        return {}
+    return {p: errors_by_principal[p] for p in principals if p in errors_by_principal}
+
+
 def evaluate_column_mask_check(
     check: ColumnMaskCheck,
     values_by_principal: Mapping[str, Mapping[Any, Any]],
+    errors_by_principal: Optional[Mapping[str, str]] = None,
 ) -> CheckResult:
-    """Assert masked principals see a *different* value than unmasked ones.
+    """Prove a mask takes effect: masked tiers get a masked value, unmasked tiers
+    get the *raw* value.
 
     ``values_by_principal`` maps ``principal -> {row_key: value}`` for this
-    (table, column). The check passes only when, for every row shared between a
-    masked principal and an unmasked (raw) principal, the masked value differs
-    from the raw value. Equality means the mask did not take effect — a leak.
+    (table, column); ``errors_by_principal`` maps ``principal -> error string``
+    for principals whose query failed.
+
+    A PASS is only returned when ALL of the following hold — otherwise the check
+    FAILs (proven violation) or is INCONCLUSIVE (could not be verified). Neither
+    passes the gate:
+
+    * No involved principal's query failed.
+    * At least one unmasked principal returned rows, and all unmasked principals
+      that returned rows **agree** on each shared row's value — that agreed value
+      is the raw ground truth. Disagreement means one of them is not actually
+      unmasked → FAIL.
+    * At least one shared row has a **non-null / non-empty** raw value — otherwise
+      the dataset cannot demonstrate masking → INCONCLUSIVE.
+    * Every masked principal that returned rows shares at least one maskable row
+      with the raw baseline, and its value there **differs** from the raw value.
+      Equality is a leak → FAIL. No overlap → INCONCLUSIVE.
     """
     target = check.describe()
+    involved = set(check.masked_principals) | set(check.unmasked_principals)
+
+    # (issue 3) Any query failure on an involved principal is a hard failure.
+    errs = _errors_for(involved, errors_by_principal)
+    if errs:
+        return CheckResult(
+            "column-mask", target, FAIL,
+            f"query failed for principal(s) — cannot verify masking: {errs}",
+            {"errors": errs},
+        )
 
     unmasked_present = [p for p in check.unmasked_principals if values_by_principal.get(p)]
-    masked_present = [p for p in check.masked_principals if p in values_by_principal]
+    masked_present = [p for p in check.masked_principals if values_by_principal.get(p)]
 
     if not unmasked_present:
         return CheckResult(
-            "column-mask", target, SKIP,
-            "no unmasked/baseline principal returned rows to compare against",
+            "column-mask", target, INCONCLUSIVE,
+            "no unmasked/baseline principal returned rows — cannot establish the "
+            "raw value to compare against",
             {"masked_principals": list(check.masked_principals)},
         )
     if not masked_present:
         return CheckResult(
-            "column-mask", target, SKIP,
-            "no masked principal returned rows",
+            "column-mask", target, INCONCLUSIVE,
+            "no masked principal returned rows — nothing to check for masking",
             {"unmasked_principals": unmasked_present},
         )
 
-    # Ground-truth raw value per row = value seen by any unmasked principal.
+    # Raw ground truth per row = the value the unmasked principals agree on.
+    # (issue 2) Disagreement means a supposedly-unmasked tier is actually masked
+    # differently, so we cannot trust any of them as raw → FAIL.
     raw_by_row: dict[Any, Any] = {}
+    conflicts: list[dict[str, Any]] = []
     for up in unmasked_present:
         for row_key, val in values_by_principal[up].items():
-            raw_by_row.setdefault(row_key, _normalize_value(val))
+            nval = _normalize_value(val)
+            if row_key not in raw_by_row:
+                raw_by_row[row_key] = nval
+            elif raw_by_row[row_key] != nval:
+                conflicts.append({
+                    "row_key": row_key, "principal": up,
+                    "value": nval, "other": raw_by_row[row_key],
+                })
+    if conflicts:
+        return CheckResult(
+            "column-mask", target, FAIL,
+            ("unmasked principals disagree on the raw value — at least one is not "
+             f"actually unmasked, so masking cannot be trusted. Sample: {conflicts[:5]}"),
+            {"conflicts": conflicts},
+        )
+
+    # (issue 2) The raw baseline must contain at least one maskable value.
+    maskable_rows = {k for k, v in raw_by_row.items() if v not in (None, "")}
+    if not maskable_rows:
+        return CheckResult(
+            "column-mask", target, INCONCLUSIVE,
+            "every raw value in the sample is NULL/empty — the dataset cannot "
+            "demonstrate that masking changes anything",
+            {"raw_rows": len(raw_by_row)},
+        )
 
     leaks: list[dict[str, Any]] = []
-    compared = 0
     masked_ok = 0
+    per_principal_compared: dict[str, int] = {}
     for mp in masked_present:
+        compared_here = 0
         for row_key, val in values_by_principal[mp].items():
-            if row_key not in raw_by_row:
+            if row_key not in maskable_rows:
                 continue
-            compared += 1
+            compared_here += 1
             masked_val = _normalize_value(val)
             raw_val = raw_by_row[row_key]
-            # NULL/empty raw values are not maskable — skip them, don't count as a leak.
-            if raw_val in (None, ""):
-                continue
             if masked_val == raw_val:
                 leaks.append({
                     "principal": mp, "row_key": row_key,
@@ -433,35 +513,58 @@ def evaluate_column_mask_check(
                 })
             else:
                 masked_ok += 1
+        per_principal_compared[mp] = compared_here
 
-    if compared == 0:
-        return CheckResult(
-            "column-mask", target, SKIP,
-            "no overlapping rows between masked and unmasked principals",
-            {},
-        )
     if leaks:
-        sample = leaks[:5]
         return CheckResult(
             "column-mask", target, FAIL,
             (f"{len(leaks)} row(s) leaked the raw value to a masked principal "
-             f"(mask not effective). Sample: {sample}"),
-            {"leaks": leaks, "compared_rows": compared, "masked_ok": masked_ok},
+             f"(mask not effective). Sample: {leaks[:5]}"),
+            {"leaks": leaks, "masked_ok": masked_ok},
         )
+
+    # (issue 2) Every masked principal must have actually been compared on a
+    # maskable row — otherwise we proved nothing for it.
+    uncompared = [p for p, n in per_principal_compared.items() if n == 0]
+    if uncompared:
+        return CheckResult(
+            "column-mask", target, INCONCLUSIVE,
+            (f"masked principal(s) {uncompared} shared no maskable row with the raw "
+             "baseline — masking could not be verified for them"),
+            {"per_principal_compared": per_principal_compared},
+        )
+
     return CheckResult(
         "column-mask", target, PASS,
-        (f"masked principal(s) {masked_present} see a different value than "
-         f"raw principal(s) {unmasked_present} across {masked_ok} row(s)"),
-        {"compared_rows": compared, "masked_ok": masked_ok},
+        (f"masked principal(s) {masked_present} see a masked value that differs "
+         f"from the raw value seen by {unmasked_present} across {masked_ok} row(s)"),
+        {"masked_ok": masked_ok, "per_principal_compared": per_principal_compared},
     )
 
 
 def evaluate_row_filter_check(
     check: RowFilterCheck,
     counts_by_principal: Mapping[str, Optional[int]],
+    errors_by_principal: Optional[Mapping[str, str]] = None,
 ) -> CheckResult:
-    """Assert restricted principals see *fewer* rows than unrestricted ones."""
+    """Prove a row filter takes effect: restricted tiers see *fewer* rows.
+
+    A count of ``None`` means "not collected" and is inconclusive; a recorded
+    query error is a hard failure. A PASS requires a positive unrestricted
+    baseline, a collected count for every restricted principal, and every
+    restricted count strictly below the baseline.
+    """
     target = check.describe()
+    involved = set(check.restricted_principals) | set(check.unrestricted_principals)
+
+    # (issue 3) Query failures are hard failures.
+    errs = _errors_for(involved, errors_by_principal)
+    if errs:
+        return CheckResult(
+            "row-filter", target, FAIL,
+            f"query failed for principal(s) — cannot verify row filter: {errs}",
+            {"errors": errs},
+        )
 
     unrestricted = {
         p: counts_by_principal[p]
@@ -476,22 +579,35 @@ def evaluate_row_filter_check(
 
     if not unrestricted:
         return CheckResult(
-            "row-filter", target, SKIP,
+            "row-filter", target, INCONCLUSIVE,
             "no unrestricted/baseline principal row count available",
             {},
         )
     if not restricted:
         return CheckResult(
-            "row-filter", target, SKIP,
+            "row-filter", target, INCONCLUSIVE,
             "no restricted principal row count available",
             {},
+        )
+
+    # A restricted principal we were asked to check but got no count for leaves
+    # a gap we cannot pass over.
+    missing_restricted = [
+        p for p in check.restricted_principals if counts_by_principal.get(p) is None
+    ]
+    if missing_restricted:
+        return CheckResult(
+            "row-filter", target, INCONCLUSIVE,
+            f"no row count for restricted principal(s) {missing_restricted} — "
+            "cannot verify the filter for them",
+            {"restricted": restricted},
         )
 
     baseline = max(unrestricted.values())
     if baseline <= 0:
         return CheckResult(
-            "row-filter", target, SKIP,
-            f"unrestricted baseline saw {baseline} rows — nothing to restrict",
+            "row-filter", target, INCONCLUSIVE,
+            f"unrestricted baseline saw {baseline} rows — cannot demonstrate restriction",
             {"unrestricted": unrestricted},
         )
 
@@ -515,15 +631,19 @@ def evaluate_effective_access(
     spec: VerificationSpec,
     column_values: Mapping[tuple, Mapping[str, Mapping[Any, Any]]],
     row_counts: Mapping[str, Mapping[str, Optional[int]]],
+    column_errors: Optional[Mapping[tuple, Mapping[str, str]]] = None,
+    row_errors: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> EffectiveAccessReport:
     """Evaluate every check in the spec against collected observations (pure)."""
     report = EffectiveAccessReport()
     for check in spec.column_masks:
         vals = column_values.get((check.table, check.column), {})
-        report.add(evaluate_column_mask_check(check, vals))
+        errs = (column_errors or {}).get((check.table, check.column), {})
+        report.add(evaluate_column_mask_check(check, vals, errs))
     for check in spec.row_filters:
         counts = row_counts.get(check.table, {})
-        report.add(evaluate_row_filter_check(check, counts))
+        errs = (row_errors or {}).get(check.table, {})
+        report.add(evaluate_row_filter_check(check, counts, errs))
     return report
 
 
@@ -568,21 +688,32 @@ class TestPrincipal:
 class EffectiveAccessVerifier:
     """Provisions per-tier test principals and runs queries as each of them.
 
-    Everything in this class touches a live workspace, so it is only reachable
-    through :func:`verify_effective_access_live`, which enforces the guard.
+    Everything in this class touches a live workspace. The live guard
+    (``GENIERAILS_LIVE_VERIFY=1``) is enforced at construction AND re-checked
+    before every method that reaches the network, so no instance can perform a
+    live call without the flag — even if it is constructed or driven directly
+    rather than through :func:`verify_effective_access_live`.
     """
 
     def __init__(self, auth: Mapping[str, str], warehouse_id: str = "",
                  name_prefix: str = "genierails-verify"):
+        _require_live_enabled()
         self.auth = dict(auth)
         self.warehouse_id = warehouse_id
         self.name_prefix = name_prefix
         self._admin_ws = None
         self._account = None
 
+    @staticmethod
+    def _guard() -> None:
+        # Re-check on every network-facing call so the flag cannot be unset (or
+        # never set) between construction and use.
+        _require_live_enabled()
+
     # -- clients -----------------------------------------------------------
     @property
     def admin_ws(self):
+        self._guard()
         if self._admin_ws is None:
             from databricks.sdk import WorkspaceClient
             self._admin_ws = WorkspaceClient(
@@ -594,6 +725,7 @@ class EffectiveAccessVerifier:
 
     @property
     def account(self):
+        self._guard()
         if self._account is None:
             from databricks.sdk import AccountClient
             self._account = AccountClient(
@@ -605,6 +737,7 @@ class EffectiveAccessVerifier:
         return self._account
 
     def resolve_warehouse(self) -> str:
+        self._guard()
         if self.warehouse_id:
             return self.warehouse_id
         # Reuse the shared warehouse-selection heuristic used elsewhere.
@@ -620,6 +753,7 @@ class EffectiveAccessVerifier:
     # -- provisioning ------------------------------------------------------
     def provision_principal(self, tier: str) -> TestPrincipal:
         """Create (or reuse) a service principal and add it to the tier group."""
+        self._guard()
         from databricks.sdk.service import iam
 
         display_name = f"{self.name_prefix}-{tier}"
@@ -666,6 +800,7 @@ class EffectiveAccessVerifier:
         )
 
     def deprovision_principal(self, principal: TestPrincipal) -> None:
+        self._guard()
         try:
             if principal.sp_id:
                 self.account.service_principals.delete(principal.sp_id)
@@ -673,6 +808,7 @@ class EffectiveAccessVerifier:
             print(f"  WARN: could not delete {principal.display_name}: {exc}")
 
     def _ws_for(self, principal: TestPrincipal):
+        self._guard()
         from databricks.sdk import WorkspaceClient
         return WorkspaceClient(
             host=self.auth["host"],
@@ -682,6 +818,7 @@ class EffectiveAccessVerifier:
 
     # -- querying ----------------------------------------------------------
     def run_query(self, ws, sql: str) -> list[list[Any]]:
+        self._guard()
         from databricks.sdk.service.sql import StatementState
 
         stmt = ws.statement_execution.execute_statement(
@@ -702,29 +839,31 @@ class EffectiveAccessVerifier:
     def collect_column_values(
         self, principal: TestPrincipal, check: ColumnMaskCheck, limit: int = 25,
     ) -> dict[Any, Any]:
-        """Return {row_key: column_value} for a principal, or {} if it cannot read."""
+        """Return {row_key: column_value} for a principal.
+
+        Raises on any failure — a failed/denied query is a verification failure,
+        not an empty (and falsely-passing) result. The caller records the error.
+        """
+        self._guard()
         if not check.key_column:
-            return {}
+            raise ValueError(
+                f"no key_column configured for {check.table}.{check.column}; "
+                "cannot pair rows across principals"
+            )
         ws = self._ws_for(principal)
         sql = (
             f"SELECT `{check.key_column}`, `{check.column}` "
             f"FROM {check.table} ORDER BY `{check.key_column}` LIMIT {int(limit)}"
         )
-        try:
-            rows = self.run_query(ws, sql)
-        except Exception as exc:
-            print(f"    ({principal.tier}) could not read {check.table}.{check.column}: {exc}")
-            return {}
+        rows = self.run_query(ws, sql)
         return {r[0]: r[1] for r in rows if r}
 
-    def collect_row_count(self, principal: TestPrincipal, table: str) -> Optional[int]:
+    def collect_row_count(self, principal: TestPrincipal, table: str) -> int:
+        """Return the row count a principal sees. Raises on query failure."""
+        self._guard()
         ws = self._ws_for(principal)
-        try:
-            rows = self.run_query(ws, f"SELECT COUNT(*) FROM {table}")
-            return int(rows[0][0]) if rows else 0
-        except Exception as exc:
-            print(f"    ({principal.tier}) could not count {table}: {exc}")
-            return None
+        rows = self.run_query(ws, f"SELECT COUNT(*) FROM {table}")
+        return int(rows[0][0]) if rows else 0
 
 
 def verify_effective_access_live(
@@ -763,26 +902,46 @@ def verify_effective_access_live(
         time.sleep(int(os.environ.get("GENIERAILS_VERIFY_PROPAGATION_SLEEP", "10")))
 
         column_values: dict[tuple, dict[str, dict[Any, Any]]] = {}
+        column_errors: dict[tuple, dict[str, str]] = {}
         for check in spec.column_masks:
             per_principal: dict[str, dict[Any, Any]] = {}
+            per_errors: dict[str, str] = {}
             for tier in set(check.masked_principals) | set(check.unmasked_principals):
                 p = principals.get(tier)
                 if p is None:
+                    # A tier in the check we could not provision leaves a gap the
+                    # evaluator must treat as a failure, not silently ignore.
+                    per_errors[tier] = "principal was not provisioned"
                     continue
-                per_principal[tier] = verifier.collect_column_values(p, check)
+                try:
+                    per_principal[tier] = verifier.collect_column_values(p, check)
+                except Exception as exc:
+                    per_errors[tier] = str(exc)
+                    print(f"    ({tier}) query FAILED for {check.table}.{check.column}: {exc}")
             column_values[(check.table, check.column)] = per_principal
+            column_errors[(check.table, check.column)] = per_errors
 
         row_counts: dict[str, dict[str, Optional[int]]] = {}
+        row_errors: dict[str, dict[str, str]] = {}
         for check in spec.row_filters:
             per_principal_counts: dict[str, Optional[int]] = {}
+            per_row_errors: dict[str, str] = {}
             for tier in set(check.restricted_principals) | set(check.unrestricted_principals):
                 p = principals.get(tier)
                 if p is None:
+                    per_row_errors[tier] = "principal was not provisioned"
                     continue
-                per_principal_counts[tier] = verifier.collect_row_count(p, check.table)
+                try:
+                    per_principal_counts[tier] = verifier.collect_row_count(p, check.table)
+                except Exception as exc:
+                    per_row_errors[tier] = str(exc)
+                    print(f"    ({tier}) COUNT FAILED for {check.table}: {exc}")
             row_counts[check.table] = per_principal_counts
+            row_errors[check.table] = per_row_errors
 
-        return evaluate_effective_access(spec, column_values, row_counts)
+        return evaluate_effective_access(
+            spec, column_values, row_counts, column_errors, row_errors,
+        )
     finally:
         if not keep_principals:
             for tier, p in principals.items():
@@ -897,8 +1056,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec = _load_spec_from_args(args)
 
     if spec.is_empty():
-        print("No effective-access checks derived from the given spec/config.")
-        return 0
+        # (issue 4) Deriving zero checks means we would verify nothing. That is
+        # never a success — a passing gate here would be a false success.
+        print(
+            "ERROR: no effective-access checks were derived from the given "
+            "spec/config — nothing would be verified. This usually means the "
+            "config has no column-mask / row-filter FGAC policies, or the tag "
+            "conditions matched no tag assignments. Refusing to report success.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.print_spec or not args.live:
         print("Resolved effective-access spec:")

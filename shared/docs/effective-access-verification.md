@@ -26,7 +26,28 @@ access tiers**:
 
 The comparison is done by *effect*: rather than assuming a mask function's exact
 output, the tool pairs each row (by a primary-key column) between a masked and an
-unmasked principal and asserts the values differ.
+unmasked principal and asserts the masked tier's value differs from the **raw**
+value the unmasked tier sees.
+
+### Inconclusive never passes
+
+A verification gate must never report success for something it did not actually
+prove, so the tool has exactly one passing outcome (**PASS**) and treats every
+non-conclusive outcome as blocking:
+
+- **FAIL** — a violation was proven (a mask leaked the raw value, a filter did
+  not restrict, unmasked principals disagreed on the raw value, or a query
+  failed / a principal could not be provisioned).
+- **INCONCLUSIVE** — the check could not be verified (no baseline rows, no
+  overlapping rows, an all-NULL/empty sample, or a restricted principal with no
+  collected count). This is kept distinct from FAIL only for diagnostics.
+
+Both FAIL and INCONCLUSIVE make `make verify-access` exit non-zero. A run that
+derives **zero** checks also exits non-zero — verifying nothing is not success.
+To keep it honest, a column-mask PASS additionally requires that the unmasked
+principals **agree** on the raw value (a disagreement means one is not really
+unmasked) and that at least one **non-NULL/non-empty** row was actually
+compared for every masked principal.
 
 ## Why dedicated per-tier test principals
 
@@ -90,11 +111,14 @@ Options (see `Makefile.shared`):
 
 The live path is **guarded**: it runs only when both `--live` is passed *and*
 `GENIERAILS_LIVE_VERIFY=1` is set (the `make verify-access` target sets both).
-It requires account-admin credentials (to create service principals and manage
+The guard is enforced at construction of the live verifier **and re-checked
+before every network call**, so no live call can happen without the flag. It
+requires account-admin credentials (to create service principals and manage
 group membership) and a running SQL warehouse. Test principals are deleted
 automatically at the end unless `KEEP_PRINCIPALS=1`.
 
-Exit code is non-zero if any check FAILs, so it drops into a CI pipeline.
+Exit code is non-zero unless **every** check PASSes (see *Inconclusive never
+passes* above), so it drops into a CI pipeline.
 
 ### Explicit spec (`--spec`)
 

@@ -5,6 +5,11 @@ query results — no Databricks connection, no warehouse, no service principals.
 The live workspace path (EffectiveAccessVerifier / verify_effective_access_live)
 is guarded behind GENIERAILS_LIVE_VERIFY and is not exercised here; only its
 guard is asserted.
+
+Guiding principle under test: a verification check only PASSES when it
+conclusively proves the policy took effect. Anything it could not verify
+(missing data, failed query, no overlap, all-null values, empty spec) is
+NON-PASSING (FAIL or INCONCLUSIVE) and blocks the gate.
 """
 import sys
 from pathlib import Path
@@ -16,13 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from verify_effective_access import (  # noqa: E402
     PASS,
     FAIL,
-    SKIP,
+    INCONCLUSIVE,
     DEFAULT_ADMIN_TIER,
     ColumnMaskCheck,
     RowFilterCheck,
     VerificationSpec,
     CheckResult,
     EffectiveAccessReport,
+    EffectiveAccessVerifier,
     parse_tag_conditions,
     resolve_columns_for_condition,
     derive_spec_from_config,
@@ -31,6 +37,7 @@ from verify_effective_access import (  # noqa: E402
     evaluate_effective_access,
     load_spec_from_file,
     verify_effective_access_live,
+    main,
 )
 
 
@@ -70,7 +77,6 @@ class TestColumnMaskComparison:
         }
         result = evaluate_column_mask_check(check, values)
         assert result.status == PASS
-        assert result.evidence["compared_rows"] == 2
         assert result.evidence["masked_ok"] == 2
 
     def test_leak_fails(self):
@@ -85,8 +91,8 @@ class TestColumnMaskComparison:
         assert result.evidence["leaks"][0]["row_key"] == 1
         assert "leaked" in result.detail
 
-    def test_null_and_empty_raw_values_not_counted_as_leak(self):
-        """NULL/empty raw values are not maskable and must not fail the check."""
+    def test_some_null_but_one_maskable_row_passes(self):
+        """NULL/empty raw values are skipped, but a maskable row still proves it."""
         check = _mask_check()
         values = {
             "Junior_Analyst":     {1: None, 2: "", 3: "XXX-XX-3333"},
@@ -94,8 +100,19 @@ class TestColumnMaskComparison:
         }
         result = evaluate_column_mask_check(check, values)
         assert result.status == PASS
-        # Only row 3 had a maskable raw value.
         assert result.evidence["masked_ok"] == 1
+
+    def test_all_null_or_empty_raw_is_inconclusive(self):
+        """If every raw value is NULL/empty the dataset cannot prove masking."""
+        check = _mask_check()
+        values = {
+            "Junior_Analyst":     {1: None, 2: ""},
+            "Compliance_Officer": {1: None, 2: ""},
+        }
+        result = evaluate_column_mask_check(check, values)
+        assert result.status == INCONCLUSIVE
+        assert not result.ok
+        assert "NULL" in result.detail or "null" in result.detail
 
     def test_value_normalization_across_types(self):
         """Numeric-looking values compare after string-normalization."""
@@ -112,28 +129,30 @@ class TestColumnMaskComparison:
         result = evaluate_column_mask_check(check, values)
         assert result.status == PASS
 
-    def test_no_unmasked_principal_skips(self):
+    def test_no_unmasked_principal_is_inconclusive(self):
         check = _mask_check(unmasked=("Compliance_Officer",))
         values = {"Junior_Analyst": {1: "XXX-XX-6789"}}
         result = evaluate_column_mask_check(check, values)
-        assert result.status == SKIP
-        assert "unmasked" in result.detail
+        assert result.status == INCONCLUSIVE
+        assert not result.ok
 
-    def test_no_masked_principal_skips(self):
+    def test_no_masked_principal_is_inconclusive(self):
         check = _mask_check()
         values = {"Compliance_Officer": {1: "123-45-6789"}}
         result = evaluate_column_mask_check(check, values)
-        assert result.status == SKIP
+        assert result.status == INCONCLUSIVE
+        assert not result.ok
 
-    def test_no_overlapping_rows_skips(self):
+    def test_no_overlapping_rows_is_inconclusive(self):
+        """No maskable row shared between masked and unmasked -> cannot verify."""
         check = _mask_check()
         values = {
             "Junior_Analyst":     {5: "XXX-XX-0000"},
             "Compliance_Officer": {1: "123-45-6789"},
         }
         result = evaluate_column_mask_check(check, values)
-        assert result.status == SKIP
-        assert "overlapping" in result.detail
+        assert result.status == INCONCLUSIVE
+        assert not result.ok
 
     def test_admin_baseline_used_as_raw(self):
         check = _mask_check(unmasked=(DEFAULT_ADMIN_TIER,))
@@ -153,6 +172,49 @@ class TestColumnMaskComparison:
         result = evaluate_column_mask_check(check, values)
         assert result.status == FAIL
         assert len(result.evidence["leaks"]) == 1
+
+    def test_conflicting_higher_tier_values_fail(self):
+        """Two 'unmasked' principals disagreeing on the raw value -> FAIL.
+
+        One of them must actually be masked differently, so no raw ground truth
+        can be trusted. This is the case a mere differ-check would wrongly pass.
+        """
+        check = ColumnMaskCheck(
+            table="fin.finance.customers", column="ssn", key_column="customer_id",
+            masked_principals=("Junior_Analyst",),
+            unmasked_principals=("Senior_Analyst", DEFAULT_ADMIN_TIER),
+        )
+        values = {
+            "Junior_Analyst":   {1: "XXX-XX-6789"},
+            "Senior_Analyst":   {1: "1XX-XX-6789"},   # differently masked!
+            DEFAULT_ADMIN_TIER: {1: "123-45-6789"},   # truly raw
+        }
+        result = evaluate_column_mask_check(check, values)
+        assert result.status == FAIL
+        assert "disagree" in result.detail
+        assert not result.ok
+
+    def test_masked_equal_to_baseline_is_leak(self):
+        """A masked principal matching the (trusted) baseline is a leak -> FAIL,
+        never a silent pass."""
+        check = _mask_check(masked=("Junior_Analyst",), unmasked=("Compliance_Officer",))
+        values = {
+            "Junior_Analyst":     {1: "123-45-6789"},
+            "Compliance_Officer": {1: "123-45-6789"},
+        }
+        result = evaluate_column_mask_check(check, values)
+        assert result.status == FAIL
+        assert not result.ok
+
+    def test_query_failure_fails(self):
+        """A recorded query error on an involved principal -> FAIL."""
+        check = _mask_check()
+        values = {"Compliance_Officer": {1: "123-45-6789"}}
+        errors = {"Junior_Analyst": "PERMISSION_DENIED: SELECT on customers"}
+        result = evaluate_column_mask_check(check, values, errors)
+        assert result.status == FAIL
+        assert "query failed" in result.detail
+        assert not result.ok
 
 
 # ---------------------------------------------------------------------------
@@ -184,31 +246,43 @@ class TestRowFilterComparison:
         result = evaluate_row_filter_check(check, counts)
         assert result.status == PASS
 
-    def test_missing_unrestricted_skips(self):
+    def test_missing_unrestricted_is_inconclusive(self):
         check = _filter_check()
         counts = {"Junior_Analyst": 5}
         result = evaluate_row_filter_check(check, counts)
-        assert result.status == SKIP
+        assert result.status == INCONCLUSIVE
+        assert not result.ok
 
-    def test_missing_restricted_skips(self):
+    def test_missing_restricted_is_inconclusive(self):
         check = _filter_check()
         counts = {"Compliance_Officer": 15}
         result = evaluate_row_filter_check(check, counts)
-        assert result.status == SKIP
+        assert result.status == INCONCLUSIVE
+        assert not result.ok
 
-    def test_zero_baseline_skips(self):
+    def test_zero_baseline_is_inconclusive(self):
         check = _filter_check()
         counts = {"Junior_Analyst": 0, "Compliance_Officer": 0}
         result = evaluate_row_filter_check(check, counts)
-        assert result.status == SKIP
-        assert "nothing to restrict" in result.detail
+        assert result.status == INCONCLUSIVE
+        assert "cannot demonstrate restriction" in result.detail
 
-    def test_none_counts_ignored(self):
-        """A principal that couldn't read (None) is treated as absent."""
+    def test_none_count_for_restricted_is_inconclusive(self):
+        """A restricted principal with no collected count is a gap, not a pass."""
         check = _filter_check(restricted=("Junior_Analyst", "Senior_Analyst"))
         counts = {"Junior_Analyst": None, "Senior_Analyst": 8, "Compliance_Officer": 15}
         result = evaluate_row_filter_check(check, counts)
-        assert result.status == PASS
+        assert result.status == INCONCLUSIVE
+        assert not result.ok
+
+    def test_query_failure_fails(self):
+        check = _filter_check()
+        counts = {"Compliance_Officer": 15}
+        errors = {"Junior_Analyst": "PERMISSION_DENIED"}
+        result = evaluate_row_filter_check(check, counts, errors)
+        assert result.status == FAIL
+        assert "query failed" in result.detail
+        assert not result.ok
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +378,6 @@ class TestDeriveSpec:
         assert mc.column == "ssn"
         assert mc.key_column == "customer_id"
         assert mc.masked_principals == ("Junior_Analyst",)
-        # Senior + Compliance are unmasked, plus the admin baseline.
         assert "Senior_Analyst" in mc.unmasked_principals
         assert "Compliance_Officer" in mc.unmasked_principals
         assert DEFAULT_ADMIN_TIER in mc.unmasked_principals
@@ -335,12 +408,10 @@ class TestDeriveSpec:
             fgac, tags, ["Junior_Analyst", "Senior_Analyst", "Compliance_Officer"],
         )
         mc = spec.column_masks[0]
-        # 'account users' itself is never a provisionable principal.
         assert "account users" not in mc.masked_principals
         assert "account users" not in mc.unmasked_principals
         assert set(mc.masked_principals) == {"Junior_Analyst", "Senior_Analyst"}
         assert mc.unmasked_principals == ("Compliance_Officer",)
-        # Admin is NOT a raw baseline for an all-users mask.
         assert DEFAULT_ADMIN_TIER not in mc.unmasked_principals
 
     def test_key_column_by_table_overrides_default(self):
@@ -359,6 +430,7 @@ class TestDeriveSpec:
         }]
         spec = derive_spec_from_config(fgac, self.TAGS, self.GROUPS)
         assert spec.column_masks == []
+        assert spec.is_empty()
 
     def test_spec_principals_excludes_admin(self):
         spec = derive_spec_from_config(self.FGAC, self.TAGS, self.GROUPS)
@@ -407,19 +479,40 @@ class TestReport:
         assert not report.passed
         assert len(report.failures) == 1
 
+    def test_report_propagates_query_errors(self):
+        spec = VerificationSpec(column_masks=[_mask_check()])
+        column_values = {("fin.finance.customers", "ssn"): {"Compliance_Officer": {1: "123-45-6789"}}}
+        column_errors = {("fin.finance.customers", "ssn"): {"Junior_Analyst": "boom"}}
+        report = evaluate_effective_access(spec, column_values, {}, column_errors, {})
+        assert not report.passed
+        assert report.results[0].status == FAIL
+
     def test_summary_renders_markers(self):
         report = EffectiveAccessReport()
         report.add(CheckResult("column-mask", "x", PASS, "ok"))
         report.add(CheckResult("row-filter", "y", FAIL, "leaked"))
         text = report.summary()
         assert "✓" in text and "✗" in text
-        assert "1 FAILED" in text
+        assert "NOT VERIFIED" in text
 
-    def test_skip_counts_as_ok(self):
+    def test_inconclusive_does_not_pass(self):
+        """A single inconclusive check must block the whole report."""
         report = EffectiveAccessReport()
-        report.add(CheckResult("column-mask", "x", SKIP, "no data"))
-        assert report.passed
-        assert report.counts()[SKIP] == 1
+        report.add(CheckResult("column-mask", "x", PASS, "ok"))
+        report.add(CheckResult("column-mask", "y", INCONCLUSIVE, "no data"))
+        assert not report.passed
+        assert len(report.failures) == 1
+        assert "NOT VERIFIED" in report.summary()
+
+    def test_empty_report_does_not_pass(self):
+        """Verifying nothing is not success."""
+        report = EffectiveAccessReport()
+        assert not report.passed
+        assert "no checks were run" in report.summary()
+
+    def test_empty_spec_report_does_not_pass(self):
+        report = evaluate_effective_access(VerificationSpec(), {}, {})
+        assert not report.passed
 
 
 # ---------------------------------------------------------------------------
@@ -449,13 +542,58 @@ class TestSpecLoading:
 
 
 # ---------------------------------------------------------------------------
-# Live guard
+# CLI: empty spec must not report success
+# ---------------------------------------------------------------------------
+class TestCliEmptySpec:
+    def test_main_returns_error_for_empty_spec(self, tmp_path, capsys):
+        spec_file = tmp_path / "empty.json"
+        spec_file.write_text('{"column_masks": [], "row_filters": []}')
+        rc = main(["--spec", str(spec_file)])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "no effective-access checks" in err.lower()
+
+    def test_main_dry_run_prints_spec(self, tmp_path, capsys):
+        spec_file = tmp_path / "spec.json"
+        spec_file.write_text(
+            '{"column_masks": [{"table": "c.s.t", "column": "ssn", "key_column": "id",'
+            '"masked_principals": ["Jr"], "unmasked_principals": ["Sr"]}],'
+            '"row_filters": []}'
+        )
+        rc = main(["--spec", str(spec_file)])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "dry run" in out
+
+
+# ---------------------------------------------------------------------------
+# Live guard — must be airtight
 # ---------------------------------------------------------------------------
 class TestLiveGuard:
-    def test_live_disabled_without_env(self, tmp_path, monkeypatch):
+    def test_orchestrator_disabled_without_env(self, tmp_path, monkeypatch):
         monkeypatch.delenv("GENIERAILS_LIVE_VERIFY", raising=False)
         with pytest.raises(RuntimeError, match="Live verification is disabled"):
             verify_effective_access_live(
                 VerificationSpec(column_masks=[_mask_check()]),
                 tmp_path / "auth.auto.tfvars",
             )
+
+    def test_verifier_construction_blocked_without_env(self, monkeypatch):
+        """The live class itself cannot even be instantiated without the flag."""
+        monkeypatch.delenv("GENIERAILS_LIVE_VERIFY", raising=False)
+        with pytest.raises(RuntimeError, match="Live verification is disabled"):
+            EffectiveAccessVerifier({"host": "h", "client_id": "c", "client_secret": "s"})
+
+    def test_verifier_methods_reguard_if_flag_unset_after_construction(self, monkeypatch):
+        """Even if constructed with the flag, a live method re-checks it."""
+        monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
+        verifier = EffectiveAccessVerifier(
+            {"host": "h", "client_id": "c", "client_secret": "s",
+             "account_host": "a", "account_id": "1"}
+        )
+        monkeypatch.delenv("GENIERAILS_LIVE_VERIFY", raising=False)
+        # No network is reached — the guard raises first.
+        with pytest.raises(RuntimeError, match="Live verification is disabled"):
+            verifier.provision_principal("Junior_Analyst")
+        with pytest.raises(RuntimeError, match="Live verification is disabled"):
+            verifier.resolve_warehouse()

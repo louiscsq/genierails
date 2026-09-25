@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Scheduled steady-state governance — opt-in snippet
+# ─────────────────────────────────────────────────────────────────────────────
+# These variables are consumed by the workspace root
+# (roots/workspace/scheduled_governance.tf). They are DISABLED by default, so
+# leaving them unset changes nothing about `make apply`.
+#
+# To enable the scheduled prod re-scan, copy the block below into the target
+# environment's env.auto.tfvars (e.g. aws/envs/prod/env.auto.tfvars) — that is
+# the tfvars file the workspace layer loads — then run `make apply ENV=prod`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Turn the scheduled job on. Default is false.
+enable_scheduled_governance = true
+
+# Which environment the scan targets, and which cloud subdir holds its envs/.
+scheduled_governance_env   = "prod"
+scheduled_governance_cloud = "aws" # "aws" | "azure"
+
+# Cadence (Quartz cron) and timezone. Default: daily at 06:00 UTC.
+scheduled_governance_cron     = "0 0 6 * * ?"
+scheduled_governance_timezone = "UTC"
+
+# Repo the job checks out to run the existing steady-state entrypoints.
+# Required when enable_scheduled_governance = true.
+scheduled_governance_git_url      = "https://github.com/<org>/<repo>"
+scheduled_governance_git_branch   = "main"
+scheduled_governance_git_provider = "gitHub" # gitHub | gitLab | bitbucketCloud | azureDevOpsServices | ...
+
+# Optional: who to email when the job fails (e.g. drift found but not resolved).
+scheduled_governance_notification_emails = ["governance-team@example.com"]
+
+# Optional: override the generated job name.
+# scheduled_governance_job_name = "GenieRails steady-state governance (prod)"

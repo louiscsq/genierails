@@ -35,9 +35,26 @@ def test_bad_env_dir_returns_2(monkeypatch, capsys):
     assert "env directory not found" in capsys.readouterr().err
 
 
-def test_coverage_no_generated_config_is_noop(tmp_path):
-    # No generated/abac.auto.tfvars present -> coverage is a clean no-op.
+def test_coverage_no_config_fails_loudly(tmp_path, capsys):
+    # No config in either layer -> hard failure, never a silent pass.
+    assert rsg._coverage(tmp_path) == 1
+    assert "no ABAC config to validate" in capsys.readouterr().err
+
+
+def test_coverage_falls_back_to_data_access_layer(tmp_path, monkeypatch):
+    # No generated/ config, but a split data_access/ config exists.
+    da = tmp_path / "data_access"
+    da.mkdir()
+    (da / "abac.auto.tfvars").write_text("tag_assignments = [\n]\n")
+    calls = {}
+
+    def fake_run(cmd, cwd):
+        calls["cmd"] = cmd
+        return 0
+
+    monkeypatch.setattr(rsg, "_run", fake_run)
     assert rsg._coverage(tmp_path) == 0
+    assert str(da / "abac.auto.tfvars") in calls["cmd"]
 
 
 def test_audit_invokes_existing_script(tmp_path, monkeypatch):
@@ -62,6 +79,15 @@ def test_delta_invokes_generate_abac_with_delta_flags(tmp_path, monkeypatch):
     assert cmd[1].endswith("generate_abac.py")
     assert "--delta" in cmd
     assert cmd[cmd.index("--auth-file") + 1] == "auth.auto.tfvars"
+    assert "--catalog" not in cmd  # omitted when no catalog given
+
+
+def test_delta_threads_catalog_when_set(tmp_path, monkeypatch):
+    calls = {}
+    monkeypatch.setattr(rsg, "_run", lambda cmd, cwd: calls.setdefault("cmd", cmd) or 0)
+    rsg._delta(tmp_path, "auth.auto.tfvars", catalog="prod_fin")
+    cmd = calls["cmd"]
+    assert cmd[cmd.index("--catalog") + 1] == "prod_fin"
 
 
 def test_coverage_includes_masking_sql_when_present(tmp_path, monkeypatch):
@@ -81,7 +107,7 @@ def test_coverage_includes_masking_sql_when_present(tmp_path, monkeypatch):
 def test_step_all_runs_all_three_steps(tmp_path, monkeypatch):
     ran = []
     monkeypatch.setattr(rsg, "_audit", lambda env_dir: ran.append("audit") or 0)
-    monkeypatch.setattr(rsg, "_delta", lambda env_dir, auth_file: ran.append("delta") or 0)
+    monkeypatch.setattr(rsg, "_delta", lambda env_dir, auth_file, catalog="": ran.append("delta") or 0)
     monkeypatch.setattr(rsg, "_coverage", lambda env_dir: ran.append("coverage") or 0)
     monkeypatch.setattr(sys, "argv", ["prog", "--env-dir", str(tmp_path), "--step", "all"])
     assert rsg.main() == 0
@@ -91,7 +117,7 @@ def test_step_all_runs_all_three_steps(tmp_path, monkeypatch):
 def test_step_all_remembers_last_nonzero_exit(tmp_path, monkeypatch):
     # A drift exit (1) from audit must not stop later steps, but is remembered.
     monkeypatch.setattr(rsg, "_audit", lambda env_dir: 1)
-    monkeypatch.setattr(rsg, "_delta", lambda env_dir, auth_file: 0)
+    monkeypatch.setattr(rsg, "_delta", lambda env_dir, auth_file, catalog="": 0)
     monkeypatch.setattr(rsg, "_coverage", lambda env_dir: 0)
     monkeypatch.setattr(sys, "argv", ["prog", "--env-dir", str(tmp_path), "--step", "all"])
     assert rsg.main() == 1

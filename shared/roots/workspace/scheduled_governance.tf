@@ -14,8 +14,12 @@
 #                         re-validate the (re)generated config for coverage
 #
 # These are the same targets a developer runs by hand today
-# (`make audit-schema`, `make generate-delta`, `make validate`); this file only
-# adds the scheduled *wrapper* — it introduces no new re-derive logic.
+# (`make audit-schema`, `make generate-delta`, `make validate-generated`); this
+# file only adds the scheduled *wrapper* — it introduces no new re-derive logic.
+#
+# All three steps run in a SINGLE task/process (run_scheduled_governance.py
+# --step all) so they share one Git checkout / working tree: the coverage check
+# validates the exact config the delta step just regenerated.
 #
 # The job is DISABLED by default (enable_scheduled_governance = false) so adding
 # this file changes nothing about `terraform apply` for existing environments.
@@ -49,6 +53,12 @@ variable "scheduled_governance_cloud" {
     condition     = contains(["aws", "azure"], var.scheduled_governance_cloud)
     error_message = "scheduled_governance_cloud must be \"aws\" or \"azure\"."
   }
+}
+
+variable "scheduled_governance_catalog" {
+  type        = string
+  default     = ""
+  description = "Optional catalog threaded to the generate-delta step (generate_abac.py --catalog), e.g. for masking-UDF catalog derivation. Empty = auto-derive from the target env's uc_tables."
 }
 
 variable "scheduled_governance_cron" {
@@ -92,6 +102,17 @@ variable "scheduled_governance_serverless_client" {
   description = "Serverless environment client version used by the job tasks."
 }
 
+variable "scheduled_governance_dependencies" {
+  type = list(string)
+  default = [
+    "python-hcl2",
+    "databricks-sdk",
+    "pyyaml",
+    "requests",
+  ]
+  description = "PyPI packages installed into the serverless environment so the steady-state scripts can read config and query the workspace. Defaults cover audit + coverage + the non-LLM delta path; append your LLM provider package (e.g. \"anthropic\") if the delta step must classify new columns."
+}
+
 variable "scheduled_governance_notification_emails" {
   type        = list(string)
   default     = []
@@ -133,62 +154,37 @@ resource "databricks_job" "scheduled_governance" {
     branch   = var.scheduled_governance_git_branch
   }
 
-  # Serverless compute for the Python tasks — no cloud-specific node types, so
-  # this stays portable across the aws/ and azure/ roots.
+  # Serverless compute for the Python task — no cloud-specific node types, so
+  # this stays portable across the aws/ and azure/ roots. The steady-state
+  # scripts need these packages to read config (python-hcl2) and query the
+  # workspace (databricks-sdk); without them the audit would silently find no
+  # managed tables instead of auditing.
   environment {
     environment_key = "governance"
     spec {
-      client = var.scheduled_governance_serverless_client
+      client       = var.scheduled_governance_serverless_client
+      dependencies = var.scheduled_governance_dependencies
     }
   }
 
-  # 1. audit-schema — report untagged sensitive columns + stale tag assignments
-  #    (== make audit-schema). Exits non-zero when drift is found, so a red
-  #    "audit_schema" task is the scheduled drift signal.
+  # Single task runs audit -> delta -> coverage in ONE process so they share the
+  # same Git checkout: coverage validates the config the delta step just wrote.
+  #   audit    == make audit-schema       (report drift)
+  #   delta    == make generate-delta     (classify new / drop stale)
+  #   coverage == make validate-generated (re-validate regenerated config)
+  # The run goes red when drift is detected (audit exit 1 is remembered) so the
+  # failure notification prompts the team to review + apply the delta.
   task {
-    task_key        = "audit_schema"
+    task_key        = "steady_state_governance"
     environment_key = "governance"
 
     spark_python_task {
       python_file = "shared/scripts/run_scheduled_governance.py"
       source      = "GIT"
-      parameters  = ["--env-dir", local.scheduled_governance_env_dir, "--step", "audit"]
-    }
-  }
-
-  # 2. generate-delta — classify new columns / drop stale assignments,
-  #    constrained to existing governed keys/values (== make generate-delta).
-  #    run_if = ALL_DONE so it still runs after audit reports drift (exit 1).
-  task {
-    task_key        = "generate_delta"
-    environment_key = "governance"
-    run_if          = "ALL_DONE"
-
-    depends_on {
-      task_key = "audit_schema"
-    }
-
-    spark_python_task {
-      python_file = "shared/scripts/run_scheduled_governance.py"
-      source      = "GIT"
-      parameters  = ["--env-dir", local.scheduled_governance_env_dir, "--step", "delta"]
-    }
-  }
-
-  # 3. coverage check — re-validate the (re)generated config so a scheduled scan
-  #    also flags coverage/consistency regressions (== make validate-generated).
-  task {
-    task_key        = "coverage_check"
-    environment_key = "governance"
-
-    depends_on {
-      task_key = "generate_delta"
-    }
-
-    spark_python_task {
-      python_file = "shared/scripts/run_scheduled_governance.py"
-      source      = "GIT"
-      parameters  = ["--env-dir", local.scheduled_governance_env_dir, "--step", "coverage"]
+      parameters = concat(
+        ["--env-dir", local.scheduled_governance_env_dir, "--step", "all"],
+        var.scheduled_governance_catalog != "" ? ["--catalog", var.scheduled_governance_catalog] : [],
+      )
     }
   }
 

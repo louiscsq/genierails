@@ -7,21 +7,24 @@ classification / re-derive logic of its own:
 
   audit    -> scripts/audit_schema_drift.py            (== make audit-schema)
   delta    -> generate_abac.py --delta --auth-file ...  (== make generate-delta)
-  coverage -> validate_abac.py generated/abac.auto.tfvars [generated/masking_functions.sql]
-              (== make validate-generated)
+  coverage -> validate_abac.py <config the delta wrote> (== make validate-generated / validate)
 
 The steady-state scripts resolve config via relative paths from the environment
-directory (envs/<env>/), so this wrapper just `chdir`s there and shells out to
-them using the same interpreter. It is meant to be driven by the scheduled
-Databricks Job defined in roots/workspace/scheduled_governance.tf, one task per
-`--step`, but also runs standalone for local testing.
+directory (envs/<env>/), so this wrapper `chdir`s there once and shells out to
+them using the same interpreter. Running all three steps in a SINGLE process
+(``--step all``, the default) is what lets ``coverage`` see the file
+``delta`` just regenerated — they share one working tree.
 
-Exit codes mirror the wrapped script:
-  audit    — 0 = no drift, 1 = drift detected (a scheduled run going red is the
-             drift signal; the delta task is wired with run_if = ALL_DONE so it
-             still runs and resolves the drift).
-  delta    — passthrough from generate_abac.py.
-  coverage — passthrough from validate_abac.py.
+It is meant to be driven by the scheduled Databricks Job defined in
+roots/workspace/scheduled_governance.tf as a single ``--step all`` task, but the
+per-step modes also run standalone for local testing.
+
+Exit codes:
+  - A drift-only run (audit found drift, delta re-derived it, coverage passed)
+    still returns non-zero: the last non-zero step code is remembered, so the
+    scheduled run goes red and notifies the team to review + apply the delta.
+  - coverage returns non-zero if there is no config to validate (a misconfigured
+    env is a hard failure, never a silent pass).
 """
 from __future__ import annotations
 
@@ -58,24 +61,44 @@ def _audit(env_dir: Path) -> int:
     )
 
 
-def _delta(env_dir: Path, auth_file: str) -> int:
-    return _run(
-        [sys.executable, str(SHARED_ROOT / "generate_abac.py"),
-         "--delta", "--auth-file", auth_file],
-        cwd=env_dir,
-    )
+def _delta(env_dir: Path, auth_file: str, catalog: str = "") -> int:
+    cmd = [sys.executable, str(SHARED_ROOT / "generate_abac.py"),
+           "--delta", "--auth-file", auth_file]
+    if catalog:
+        cmd += ["--catalog", catalog]
+    return _run(cmd, cwd=env_dir)
 
 
 def _coverage(env_dir: Path) -> int:
-    tfvars = env_dir / "generated" / "abac.auto.tfvars"
-    if not tfvars.exists():
-        print(f"  Coverage check: no {tfvars} to validate — nothing to check.")
-        return 0
-    cmd = [sys.executable, str(SHARED_ROOT / "validate_abac.py"), str(tfvars)]
-    masking = env_dir / "generated" / "masking_functions.sql"
-    if masking.exists():
-        cmd.append(str(masking))
-    return _run(cmd, cwd=env_dir)
+    """Validate the config layer the delta step actually writes to.
+
+    generate_abac.py --delta merges into generated/abac.auto.tfvars when it
+    exists, otherwise into the split data_access/abac.auto.tfvars — so this
+    mirrors that choice (== make validate-generated / make validate). If there
+    is no ABAC config in either layer, that is a misconfigured env: fail loudly
+    rather than silently pass.
+    """
+    generated = env_dir / "generated" / "abac.auto.tfvars"
+    split_da = env_dir / "data_access" / "abac.auto.tfvars"
+
+    if generated.exists():
+        cmd = [sys.executable, str(SHARED_ROOT / "validate_abac.py"), str(generated)]
+        masking = env_dir / "generated" / "masking_functions.sql"
+        if masking.exists():
+            cmd.append(str(masking))
+        return _run(cmd, cwd=env_dir)
+
+    if split_da.exists():
+        cmd = [sys.executable, str(SHARED_ROOT / "validate_abac.py"), str(split_da)]
+        masking = env_dir / "data_access" / "masking_functions.sql"
+        if masking.exists():
+            cmd.append(str(masking))
+        return _run(cmd, cwd=env_dir)
+
+    print(f"ERROR: coverage check found no ABAC config to validate in {env_dir} "
+          f"(looked for generated/abac.auto.tfvars and data_access/abac.auto.tfvars).",
+          file=sys.stderr)
+    return 1
 
 
 def main() -> int:
@@ -84,9 +107,13 @@ def main() -> int:
     parser.add_argument("--env-dir", required=True,
                         help="Target environment directory (absolute, or repo-relative like 'aws/envs/prod').")
     parser.add_argument("--step", choices=(*STEPS, "all"), default="all",
-                        help="Which steady-state step to run (default: all, in order audit -> delta -> coverage).")
+                        help="Which steady-state step to run. Default 'all' runs audit -> delta -> coverage "
+                             "in ONE process so coverage sees the config delta just wrote.")
     parser.add_argument("--auth-file", default="auth.auto.tfvars",
                         help="Auth tfvars filename passed to generate_abac.py --delta (default: auth.auto.tfvars).")
+    parser.add_argument("--catalog", default="",
+                        help="Optional catalog threaded to generate_abac.py --delta (--catalog). "
+                             "Empty = auto-derive from the env's uc_tables.")
     args = parser.parse_args()
 
     env_dir = _resolve_env_dir(args.env_dir)
@@ -103,7 +130,7 @@ def main() -> int:
         if step == "audit":
             step_rc = _audit(env_dir)
         elif step == "delta":
-            step_rc = _delta(env_dir, args.auth_file)
+            step_rc = _delta(env_dir, args.auth_file, args.catalog)
         else:
             step_rc = _coverage(env_dir)
         # For a single-step invocation, mirror the wrapped script's exit code.

@@ -41,7 +41,7 @@ variable "tag_assignments" {
     tag_value   = string
   }))
   default     = []
-  description = "Tag-to-entity mappings."
+  description = "Classifier-owned tag-to-entity facts. Promotion leaves this empty so each environment derives assignments from its own classification scan."
 }
 
 variable "fgac_policies" {

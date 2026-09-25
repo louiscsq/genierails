@@ -72,6 +72,12 @@ resource "databricks_entity_tag_assignment" "assignments" {
   entity_name = each.value.entity_name
   tag_key     = each.value.tag_key
   tag_value   = each.value.tag_value
+
+  # Classification facts are owned by the environment's classifier. Do not
+  # reconcile classifier updates back to a promoted Terraform snapshot.
+  lifecycle {
+    ignore_changes = all
+  }
 }
 
 resource "time_sleep" "wait_for_tag_propagation" {

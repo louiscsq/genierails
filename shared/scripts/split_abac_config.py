@@ -28,7 +28,6 @@ ACCOUNT_KEYS = (
 
 DATA_ACCESS_KEYS = (
     "groups",
-    "tag_assignments",
     "fgac_policies",
 )
 
@@ -426,7 +425,8 @@ def main():
 # DATA-ACCESS-OWNED ABAC CONFIG
 # ============================================================================
 # Generated from the workspace draft for this environment's governance layer.
-# Owns group references, tag assignments, and FGAC policies.
+# Owns group references and FGAC policy rules. Tag assignments are classifier-owned
+# facts and are re-derived independently in each environment.
 # Tag policy definitions live in envs/account — not here.
 # ============================================================================
 """

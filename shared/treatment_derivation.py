@@ -65,7 +65,13 @@ def derive_treatment_model(cfg: dict, config: TreatmentConfig) -> tuple[dict, in
         source = (assignment.get("tag_key", ""), assignment.get("tag_value", ""))
         if assignment.get("entity_type") == "columns" and source in mapped_sources:
             by_column.setdefault(assignment.get("entity_name", ""), []).append(source)
-        else:
+        # Sensitivity tags are owned by their detection sources and must remain
+        # in the emitted model. Only this transform's prior column assignment is
+        # replaced, so repeated derivation cannot accumulate treatment values.
+        if not (
+            assignment.get("entity_type") == "columns"
+            and assignment.get("tag_key") == config.tag_key
+        ):
             retained.append(assignment)
 
     derived: list[dict] = []
@@ -132,13 +138,21 @@ def matching_masks_by_column(cfg: dict) -> dict[str, list[str]]:
     """Return matching column-mask names for each assigned treatment column."""
     import re
     masks = [p for p in (cfg.get("fgac_policies") or []) if p.get("policy_type") == "POLICY_TYPE_COLUMN_MASK"]
-    result: dict[str, list[str]] = {}
+    tags_by_column: dict[str, set[tuple[str, str]]] = {}
     for assignment in cfg.get("tag_assignments") or []:
         if assignment.get("entity_type") != "columns":
             continue
         column = assignment.get("entity_name", "")
-        tags = {(assignment.get("tag_key", ""), assignment.get("tag_value", ""))}
+        tags_by_column.setdefault(column, set()).add(
+            (assignment.get("tag_key", ""), assignment.get("tag_value", ""))
+        )
+
+    result: dict[str, list[str]] = {}
+    for column, tags in tags_by_column.items():
+        catalog = column.split(".", 1)[0]
         for policy in masks:
+            if policy.get("catalog") != catalog:
+                continue
             refs = set(re.findall(r"hasTagValue\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", policy.get("match_condition", "")))
             if refs and refs <= tags:
                 result.setdefault(column, []).append(policy.get("name", ""))

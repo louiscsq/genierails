@@ -44,10 +44,65 @@ def test_precedence_multi_tag_column_resolves_to_single_strictest_treatment():
         item for item in derived["tag_assignments"]
         if item["entity_name"] == "cat.sch.people.contact"
     ]
-    assert contact == [{
+    assert contact[-1:] == [{
         "entity_type": "columns", "entity_name": "cat.sch.people.contact",
         "tag_key": "gr.treatment", "tag_value": "redact",
     }]
+    assert {(item["tag_key"], item["tag_value"]) for item in contact[:-1]} == {
+        ("pii_level", "masked_email"),
+        ("pci_level", "redacted_cvv"),
+    }
+
+
+def test_single_tag_ssn_resolves_to_treatment():
+    derived, _ = derive_treatment_model(_base_config(), load_treatment_config())
+    treatments = [
+        item for item in derived["tag_assignments"]
+        if item["entity_name"] == "cat.sch.people.ssn"
+        and item["tag_key"] == "gr.treatment"
+    ]
+    assert [item["tag_value"] for item in treatments] == ["ssn_last4"]
+
+
+def test_unknown_tag_resolves_to_no_treatment():
+    assert resolve_treatment(
+        [("pii_level", "future_unknown_value")], load_treatment_config()
+    ) is None
+
+
+def test_column_without_sensitivity_tag_gets_no_treatment():
+    cfg = _base_config()
+    cfg["tag_assignments"].append({
+        "entity_type": "columns", "entity_name": "cat.sch.people.public_id",
+        "tag_key": "quality", "tag_value": "verified",
+    })
+    derived, _ = derive_treatment_model(cfg, load_treatment_config())
+    assert not any(
+        item["entity_name"] == "cat.sch.people.public_id"
+        and item["tag_key"] == "gr.treatment"
+        for item in derived["tag_assignments"]
+    )
+
+
+def test_derivation_is_idempotent_and_preserves_masks_and_source_tags():
+    config = load_treatment_config()
+    once, _ = derive_treatment_model(_base_config(), config)
+    twice, _ = derive_treatment_model(once, config)
+    assert twice == once
+
+    masks = [
+        policy for policy in twice["fgac_policies"]
+        if policy["policy_type"] == "POLICY_TYPE_COLUMN_MASK"
+    ]
+    assert masks
+    treatment_counts = {}
+    for item in twice["tag_assignments"]:
+        if item["entity_type"] == "columns" and item["tag_key"] == "gr.treatment":
+            treatment_counts[item["entity_name"]] = treatment_counts.get(item["entity_name"], 0) + 1
+    assert treatment_counts
+    assert set(treatment_counts.values()) == {1}
+    assert any(item["tag_key"] == "pii_level" for item in twice["tag_assignments"])
+    assert any(item["tag_key"] == "pci_level" for item in twice["tag_assignments"])
 
 
 def test_rekeyed_masks_match_no_column_more_than_once():
@@ -57,4 +112,16 @@ def test_rekeyed_masks_match_no_column_more_than_once():
     assert all(len(policy_names) == 1 for policy_names in matches.values())
     masks = [p for p in derived["fgac_policies"] if p["policy_type"] == "POLICY_TYPE_COLUMN_MASK"]
     assert all("hasTagValue('gr.treatment'," in p["match_condition"] for p in masks)
-    assert len({p["match_condition"] for p in masks}) == len(masks)
+
+
+def test_multi_catalog_masks_are_scoped_to_one_match_per_column():
+    cfg = _base_config()
+    cfg["tag_assignments"].append({
+        "entity_type": "columns", "entity_name": "other.sch.people.ssn",
+        "tag_key": "pii_level", "tag_value": "masked_ssn",
+    })
+    derived, _ = derive_treatment_model(cfg, load_treatment_config())
+    matches = matching_masks_by_column(derived)
+    assert len(matches["cat.sch.people.ssn"]) == 1
+    assert len(matches["other.sch.people.ssn"]) == 1
+    assert matches["cat.sch.people.ssn"] != matches["other.sch.people.ssn"]

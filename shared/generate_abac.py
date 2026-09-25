@@ -2811,8 +2811,10 @@ def derive_enforcement_treatments(tfvars_path: Path) -> int:
         import hcl2
         text = tfvars_path.read_text()
         cfg = hcl2.loads(text)
-    except Exception:
-        return 0
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot derive enforcement treatments from {tfvars_path}: {exc}"
+        ) from exc
 
     derived, changes = derive_treatment_model(cfg, load_treatment_config())
     if not changes:

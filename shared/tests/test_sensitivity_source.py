@@ -106,6 +106,13 @@ class TestClassificationSourceResults:
         assert (findings[0].tag_key, findings[0].tag_value) == ("pii_level", "masked_ssn")
         assert findings[0].source == CLASSIFICATION
 
+    def test_maps_namespaced_class_tag_value(self):
+        # data_classification.results.class_tag may be namespaced (class.us_ssn).
+        rows = [("cat", "sch", "tbl", "national_id", "class.us_ssn")]
+        src = ClassificationSource(classification_rows=rows)
+        findings = src.findings_for(["cat.sch.tbl.national_id"])
+        assert [(f.tag_key, f.tag_value) for f in findings] == [("pii_level", "masked_ssn")]
+
 
 # ---------------------------------------------------------------------------
 # ClassificationSource.from_run_sql — mocked warehouse reads
@@ -131,6 +138,26 @@ class TestClassificationSourceFromRunSql:
         tags_sql = next(s for s in seen_sql if "column_tags" in s)
         assert "like 'class.%'" in tags_sql.lower()
         assert "'cat.sch.tbl'" in tags_sql
+
+    def test_results_table_projection_uses_class_tag(self):
+        # Regression: the results read must project `class_tag` (not the
+        # non-existent `class_name`), and those rows must produce findings.
+        seen_sql = []
+
+        def fake_run_sql(sql):
+            seen_sql.append(sql)
+            if "data_classification.results" in sql:
+                return [["cat", "sch", "tbl", "national_id", "class.us_ssn"]]
+            return []  # no class.* column_tags
+
+        src = ClassificationSource.from_run_sql(fake_run_sql, ["cat.sch.tbl"])
+        results_sql = next(s for s in seen_sql if "data_classification.results" in s)
+        assert "class_tag" in results_sql
+        assert "class_name" not in results_sql
+        findings = src.findings_for(["cat.sch.tbl.national_id"])
+        assert [(f.tag_key, f.tag_value, f.source) for f in findings] == [
+            ("pii_level", "masked_ssn", CLASSIFICATION)
+        ]
 
     def test_wildcard_refs_are_skipped(self):
         calls = []
@@ -199,6 +226,25 @@ class TestSelectFindings:
         llm = _llm_from({"c.s.t.email": ("pii_level", "masked_email")})
         result = {f.entity_name: f.source for f in select_findings(cols, classification, llm)}
         assert result == {"c.s.t.contact": CLASSIFICATION, "c.s.t.email": LLM}
+
+    def test_unmapped_class_tag_is_authoritative_and_blocks_llm(self):
+        # A class.* tag we do not map must NOT let the LLM tag that column.
+        cols = ["c.s.t.mystery", "c.s.t.email"]
+        classification = ClassificationSource(
+            tag_rows=[("c", "s", "t", "mystery", "class.some_novel_type", "")],
+        )
+        llm = _llm_from({"c.s.t.mystery": ("pii_level", "masked_email"),
+                         "c.s.t.email": ("pii_level", "masked_email")})
+        result = select_findings(cols, classification, llm)
+        by_name = {f.entity_name: f for f in result}
+        # the classified-but-unmapped column produced no finding at all...
+        assert "c.s.t.mystery" not in by_name
+        # ...and crucially the LLM did NOT get to tag it
+        assert not any(f.entity_name == "c.s.t.mystery" for f in result)
+        # the un-classified column still falls back to the LLM
+        assert by_name["c.s.t.email"].source == LLM
+        # and it is reported as authoritative-but-unmapped for surfacing
+        assert classification.unmapped_columns(cols) == [("c.s.t.mystery", "some_novel_type")]
 
 
 # ---------------------------------------------------------------------------
@@ -290,3 +336,54 @@ class TestAutofixIntegration:
         out = capsys.readouterr().out
         assert "[source: classification]" in out
         assert "[source: llm]" in out
+
+    def test_classification_finding_dropped_when_uncovered(self, tmp_path, capsys):
+        # A classification value with no covering masking function must NOT be
+        # injected — it goes through the SAME coverage check as the LLM path.
+        import generate_abac
+        tfvars = tmp_path / "abac.auto.tfvars"
+        tfvars.write_text(_TFVARS)
+        ddl = tmp_path / "ddl" / "_fetched.sql"
+        ddl.parent.mkdir(parents=True)
+        ddl.write_text(
+            "CREATE TABLE cat.sch.tbl (\n  id BIGINT,\n  birthdate STRING\n);\n"
+        )
+        # SQL file covers only masked_email; masked_dob (needs mask_date_to_year)
+        # is therefore uncovered.
+        sql = tmp_path / "masking_functions.sql"
+        sql.write_text("CREATE FUNCTION cat.sch.mask_email(x STRING) RETURNS STRING RETURN x;\n")
+
+        classification = ClassificationSource(
+            tag_rows=[("cat", "sch", "tbl", "birthdate", "class.date_of_birth", "")],
+        )
+        added = generate_abac.autofix_untagged_pii_columns(
+            tfvars, ddl_path=ddl, sql_path=sql, classification_source=classification,
+        )
+        # nothing added: classification's masked_dob is uncovered and dropped,
+        # and the LLM is suppressed on that (natively-classified) column.
+        assert added == 0
+        cfg = assert_valid_hcl(tfvars)
+        assert not any(a["entity_name"] == "cat.sch.tbl.birthdate"
+                       for a in cfg["tag_assignments"])
+        out = capsys.readouterr().out
+        assert "no covering masking function" in out
+
+    def test_unmapped_native_class_surfaced_and_llm_suppressed(self, _paths, capsys):
+        # 'contact' carries an unmapped class.* tag: no governed tag applied,
+        # LLM override suppressed, and the column surfaced in the log.
+        import generate_abac
+        tfvars, ddl = _paths
+        classification = ClassificationSource(
+            tag_rows=[("cat", "sch", "tbl", "contact", "class.some_novel_type", "")],
+        )
+        added = generate_abac.autofix_untagged_pii_columns(
+            tfvars, ddl_path=ddl, classification_source=classification,
+        )
+        # only 'email' (LLM) is tagged; 'contact' is claimed-but-unmapped
+        assert added == 1
+        cfg = assert_valid_hcl(tfvars)
+        assert not any(a["entity_name"] == "cat.sch.tbl.contact"
+                       for a in cfg["tag_assignments"])
+        out = capsys.readouterr().out
+        assert "cat.sch.tbl.contact" in out
+        assert "no governed mapping" in out

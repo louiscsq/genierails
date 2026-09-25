@@ -5260,6 +5260,34 @@ def autofix_untagged_pii_columns(
     llm_source = LLMSource(_ddl_pattern_infer)
     findings = select_findings(candidate_columns, classification_source, llm_source)
 
+    # Route EVERY finding (classification and LLM alike) through the same
+    # covering-function check, so no source can introduce a tag_value that has
+    # no masking function to cover it.  LLM findings are already pre-filtered via
+    # active_patterns, so in practice this only ever drops an uncovered
+    # classification value.
+    covered_findings: list[Finding] = []
+    for f in findings:
+        if _any_covering_fn_available(f.tag_value):
+            covered_findings.append(f)
+        else:
+            print(
+                f"  [SENSITIVITY] Skipped {f.source} tag for {f.entity_name} "
+                f"({f.tag_key} = '{f.tag_value}'): no covering masking function available"
+            )
+    findings = covered_findings
+
+    # Surface natively-classified columns we could not tag (unmapped class.*
+    # semantic), so a reviewer / coverage gate sees that authority was claimed
+    # but no governed tag applied.  These columns are still NOT handed to the LLM
+    # (select_findings claimed them), preventing a silent LLM override.
+    if classification_source is not None and hasattr(classification_source, "unmapped_columns"):
+        for entity_name, semantic in classification_source.unmapped_columns(candidate_columns):
+            print(
+                f"  [SENSITIVITY] Column {entity_name} carries native "
+                f"class.{semantic} with no governed mapping — left untagged "
+                "(LLM override suppressed)"
+            )
+
     if not findings:
         return 0
 

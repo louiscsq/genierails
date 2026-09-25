@@ -91,6 +91,17 @@ class SensitivitySource(ABC):
         """
         raise NotImplementedError
 
+    def claimed_columns(self, columns: Sequence[str]) -> set[str]:
+        """Columns this source is *authoritative* over, even without a finding.
+
+        A claimed column is never overridden by a lower-priority source in
+        :func:`select_findings`, whether or not this source emitted a mapped
+        finding for it.  The default is "only columns I produced findings for";
+        :class:`ClassificationSource` widens this to every natively-classified
+        column so an unmapped ``class.*`` tag can never fall through to the LLM.
+        """
+        return {f.entity_name for f in self.findings_for(columns)}
+
 
 # ---------------------------------------------------------------------------
 # Native classification → governed vocabulary
@@ -116,6 +127,10 @@ _CLASS_TO_GOVERNED: dict[str, tuple[str, str]] = {
     "birth_date": ("pii_level", "masked_dob"),
     "ssn": ("pii_level", "masked_ssn"),
     "social_security_number": ("pii_level", "masked_ssn"),
+    # Databricks native data-classification semantic tags (documented `class.*`)
+    "us_ssn": ("pii_level", "masked_ssn"),
+    "us_social_security_number": ("pii_level", "masked_ssn"),
+    "us_itin": ("pii_level", "masked_ssn"),
     "tfn": ("pii_level", "masked_tfn"),
     "tax_file_number": ("pii_level", "masked_tfn"),
     "medicare": ("pii_level", "masked_medicare"),
@@ -127,7 +142,10 @@ _CLASS_TO_GOVERNED: dict[str, tuple[str, str]] = {
     "mykad": ("pii_level", "masked_mykad"),
     "bank_account": ("pii_level", "masked_account"),
     "bank_account_number": ("pii_level", "masked_account"),
+    "us_bank_account_number": ("pii_level", "masked_account"),
     "account_number": ("pii_level", "masked_account"),
+    "iban": ("pii_level", "masked_account"),
+    "iban_code": ("pii_level", "masked_account"),
     "credit_card": ("pci_level", "masked_card_last4"),
     "credit_card_number": ("pci_level", "masked_card_last4"),
     "card_number": ("pci_level", "masked_card_last4"),
@@ -135,6 +153,12 @@ _CLASS_TO_GOVERNED: dict[str, tuple[str, str]] = {
     "cvv": ("pci_level", "redacted_cvv"),
     "cvc": ("pci_level", "redacted_cvv"),
 }
+
+# Alias set kept in sync with the coverable governed values above.  Any native
+# class semantic NOT present here is still treated as authoritative (a
+# classified column is never handed to the LLM), just "unmapped": no governed
+# tag is emitted for it and it is surfaced in the log so the coverage/overlap
+# gate can pick it up.  See ClassificationSource.claimed_columns / findings_for.
 
 
 def _normalize_semantic(text: str) -> str:
@@ -220,6 +244,41 @@ class ClassificationSource(SensitivitySource):
                 cols.add(entity_name)
         return cols
 
+    def claimed_columns(self, columns: Sequence[str]) -> set[str]:
+        """Every natively-classified column in ``columns`` is authoritative.
+
+        This is deliberately wider than ``findings_for``: a column carrying a
+        ``class.*`` tag whose semantic we don't (yet) map is still claimed, so
+        the LLM never gets to override a natively-classified column.
+        """
+        wanted = set(columns) if columns else None
+        classified = self.classified_columns()
+        if wanted is None:
+            return classified
+        return {c for c in classified if c in wanted}
+
+    def unmapped_columns(self, columns: Sequence[str] | None = None) -> list[tuple[str, str]]:
+        """(entity_name, semantic) for classified columns we produced no tag for.
+
+        These are authoritative-but-unmapped: no governed tag is applied and the
+        LLM is still blocked, so a caller can surface them (e.g. so a coverage /
+        overlap gate flags that a natively-classified column went un-tagged).
+        """
+        wanted = set(columns) if columns else None
+        out: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for entity_name, semantic, _raw in self._iter_semantics():
+            if wanted is not None and entity_name not in wanted:
+                continue
+            if semantic in self._mapping:
+                continue
+            key = (entity_name, semantic)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
     def findings_for(self, columns: Sequence[str]) -> list[Finding]:
         wanted = set(columns) if columns else None
         findings: list[Finding] = []
@@ -261,8 +320,13 @@ class ClassificationSource(SensitivitySource):
         for row in self._classification_rows:
             if len(row) < 5:
                 continue
-            catalog, schema, table, column, class_name = row[:5]
-            semantic = _normalize_semantic(str(class_name))
+            catalog, schema, table, column, class_tag = row[:5]
+            # class_tag may arrive namespaced (``class.us_ssn``) or bare
+            # (``us_ssn``); normalise both to the semantic suffix.
+            raw = str(class_tag or "")
+            if raw.lower().startswith(CLASS_NAMESPACE):
+                raw = raw[len(CLASS_NAMESPACE):]
+            semantic = _normalize_semantic(raw)
             if not semantic:
                 continue
             entity_name = f"{catalog}.{schema}.{table}.{column}"
@@ -298,9 +362,11 @@ def select_findings(
 ) -> list[Finding]:
     """Combine sources with the default classification-else-LLM rule.
 
-    For any column that the classification source has a finding for, only its
-    classification finding(s) are kept; the LLM source is the fallback for every
-    other column.  Classification findings are returned first (in source order),
+    Any column the classification source *claims* (see
+    :meth:`SensitivitySource.claimed_columns`) is authoritative and is never
+    handed to the LLM — this includes natively-classified columns whose semantic
+    is unmapped, which produce no finding but must still block the LLM.  The
+    classification source's mapped findings are returned first (in source order),
     then the surviving LLM findings — so when the classification source is empty
     (or ``None``), the result equals ``llm_source.findings_for(columns)`` in the
     same order, keeping legacy behaviour byte-identical.
@@ -308,10 +374,12 @@ def select_findings(
     class_findings: list[Finding] = (
         classification_source.findings_for(columns) if classification_source is not None else []
     )
-    classified_cols = {f.entity_name for f in class_findings}
+    claimed_cols = (
+        classification_source.claimed_columns(columns) if classification_source is not None else set()
+    )
     result = list(class_findings)
     for f in llm_source.findings_for(columns):
-        if f.entity_name not in classified_cols:
+        if f.entity_name not in claimed_cols:
             result.append(f)
     return result
 
@@ -351,16 +419,16 @@ ORDER BY catalog_name, schema_name, table_name, column_name, tag_name"""
 def _read_data_classification_results(run_sql: Callable[[str], list], table_refs: Sequence[str]) -> list[tuple]:
     """Read semantic types from system.data_classification.results, if present.
 
-    Column layout varies by workspace/version, so this selects a conservative
-    set of columns.  Callers wrap this in try/except — a missing table is not
-    fatal.
+    The result's semantic type is the ``class_tag`` column (e.g. ``class.us_ssn``
+    or ``us_ssn``) — not ``class_name``.  Callers wrap this in try/except — a
+    missing table is not fatal.
     """
     fqns = _table_fqns_from_refs(table_refs)
     if not fqns:
         return []
     table_list = _quote_list(fqns)
     sql = f"""\
-SELECT catalog_name, schema_name, table_name, column_name, class_name
+SELECT catalog_name, schema_name, table_name, column_name, class_tag
 FROM system.data_classification.results
 WHERE concat(catalog_name, '.', schema_name, '.', table_name) IN ({table_list})"""
     return [tuple(row) for row in (run_sql(sql) or [])]

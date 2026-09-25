@@ -57,6 +57,11 @@ locals {
     split(".", t)[0]
   ]
 
+  uc_schemas = distinct([
+    for t in var.uc_tables :
+    join(".", slice(split(".", t), 0, 2))
+  ])
+
   all_catalogs = distinct(concat(
     local._ta_catalogs,
     local._fgac_catalogs,
@@ -103,7 +108,31 @@ resource "databricks_grant" "catalog_access" {
   provider   = databricks.workspace
   catalog    = each.value.catalog
   principal  = each.value.group
-  privileges = ["USE_CATALOG", "USE_SCHEMA", "SELECT"]
+  privileges = ["USE_CATALOG"]
+}
+
+resource "databricks_grant" "schema_access" {
+  for_each = {
+    for pair in setproduct(local.uc_schemas, keys(var.groups)) :
+    "${pair[0]}|${pair[1]}" => { schema = pair[0], group = pair[1] }
+  }
+
+  provider   = databricks.workspace
+  schema     = each.value.schema
+  principal  = each.value.group
+  privileges = ["USE_SCHEMA"]
+}
+
+resource "databricks_grant" "table_access" {
+  for_each = {
+    for pair in setproduct(var.uc_tables, keys(var.groups)) :
+    "${pair[0]}|${pair[1]}" => { table = pair[0], group = pair[1] }
+  }
+
+  provider   = databricks.workspace
+  table      = each.value.table
+  principal  = each.value.group
+  privileges = ["SELECT"]
 }
 
 resource "databricks_sql_endpoint" "warehouse" {
@@ -195,6 +224,8 @@ resource "databricks_policy_info" "policies" {
   depends_on = [
     time_sleep.wait_for_tag_propagation,
     databricks_grant.catalog_access,
+    databricks_grant.schema_access,
+    databricks_grant.table_access,
     databricks_grant.terraform_sp_manage_catalog,
     null_resource.deploy_masking_functions,
   ]

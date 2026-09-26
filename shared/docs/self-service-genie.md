@@ -41,7 +41,7 @@ Workspace layer    →  Workspace Assignment + Entitlements + Genie Spaces + ACL
                         applied by: make apply-genie ENV=<bu-env>
 ```
 
-The workspace module (`modules/workspace/main.tf`) looks up groups by name — it never creates them. This means BU teams can reference groups created by the governance team without any additional coordination.
+The workspace module (`modules/workspace/main.tf`) looks up groups by name — it never creates them. This means BU teams can reference the IdP-synced access-tier groups (provisioned via AIM, or SCIM where AIM isn't available) without any additional coordination. The IdP owns groups and membership; the governance team owns grants and ABAC, and consumes those groups by name.
 
 Catalog grants (`USE_CATALOG`, `USE_SCHEMA`, `SELECT`) are applied by the governance team's data_access layer. Once in place, BU teams' Genie spaces can query those catalogs immediately.
 
@@ -155,7 +155,7 @@ By default, the workspace layer looks up groups at the account level, which requ
 | UC table access | Implicit (SP is metastore admin) | Explicit grants required (step 3) |
 | SP role required | Account Admin + Workspace Admin + Metastore Admin | Workspace USER + SQL entitlement |
 
-The governance team manages groups, workspace assignments, entitlements, warehouses, UC grants, and Genie Space ACLs via `make apply-governance`. The BU team only manages Genie Space creation and configuration.
+The governance team manages workspace assignments, entitlements, warehouses, UC grants, and Genie Space ACLs via `make apply-governance` — attaching them to the IdP-synced groups it consumes by name (the IdP owns the groups and their membership; GenieRails does not mint them). The BU team only manages Genie Space creation and configuration.
 
 > **Tested:** The `genie-only` integration test (`make test-genie-only`) creates a minimal-privilege SP with only workspace USER + SQL entitlement (no admin roles), grants it CAN USE on a warehouse and UC table access, and verifies the full `genie_only = true` flow end-to-end — including confirming that zero account-level resources appear in Terraform state.
 

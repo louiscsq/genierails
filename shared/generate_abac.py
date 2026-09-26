@@ -1084,8 +1084,17 @@ def build_prompt(ddl_text: str,
                  space_names: list[str] | None = None,
                  mode: str = "full",
                  countries: list[str] | None = None,
-                 industries: list[str] | None = None) -> str:
+                 industries: list[str] | None = None,
+                 create_groups: bool = False) -> str:
     """Build the full prompt by injecting DDL and optional group names into the template.
+
+    create_groups controls group ownership in the generated config:
+      * False (DEFAULT, consume) — the LLM must reuse the supplied ``group_names``
+        exactly and must NOT invent, propose, or rename groups. The template's
+        group-invention instructions are stripped so the LLM cannot mint groups
+        that the consume-by-default account layer would then fail to look up.
+      * True (opt-in, demo/greenfield) — the LLM proposes its own access-tier
+        groups and the account layer creates them.
 
     When countries is set, country-specific identifier overlays are loaded from
     shared/countries/ and injected into the prompt to teach the LLM about
@@ -1103,6 +1112,23 @@ def build_prompt(ddl_text: str,
     keys in genie_space_configs — preventing it from inventing its own titles.
     """
     template = PROMPT_TEMPLATE_PATH.read_text()
+
+    # Consume-by-default: unless create mode is explicitly requested, strip the
+    # template's group-invention instructions so the LLM reuses the supplied
+    # IdP-synced groups instead of minting new ones. Keeping numbering intact,
+    # each invention line is rewritten (not deleted) into a consume instruction.
+    if not create_groups:
+        template = template.replace(
+            '1. Create **groups** (access tiers like "Junior_Analyst", "Admin")',
+            '1. Use the **groups** provided under "REQUIRED GROUP NAMES" — existing '
+            'IdP-synced access tiers. Do NOT invent, rename, or add groups.',
+        ).replace(
+            "3. Propose groups — typically 2-5 access tiers "
+            "(e.g., restricted, standard, privileged, admin)",
+            '3. Use the group names provided under "REQUIRED GROUP NAMES" exactly — '
+            "do NOT propose or invent new groups (they are owned by the IdP and "
+            "consumed by name, not created here).",
+        )
 
     section_marker = "### MY TABLES"
     idx = template.find(section_marker)
@@ -5660,6 +5686,100 @@ def load_groups_from_account_config() -> list[str]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# IdP group preflight (consume-by-default)
+#
+# GenieRails consumes existing IdP-synced access-tier groups by default and does
+# not mint them. Before we hand a group->tier mapping to Terraform, verify every
+# referenced group actually exists as an account-level (IdP-synced) group, so a
+# typo or an un-synced group fails loudly here instead of silently producing a
+# grant that matches nobody.
+# ---------------------------------------------------------------------------
+class GroupPreflightError(RuntimeError):
+    """Raised when a referenced access-tier group is not synced from the IdP."""
+
+
+def find_missing_idp_groups(referenced, existing) -> list[str]:
+    """Return the referenced group names that are absent from ``existing``.
+
+    Pure helper: comparison is exact on display name. ``existing`` is any
+    iterable of account-level group display names. Order and de-duplication of
+    the returned list follow first appearance in ``referenced``.
+    """
+    existing_set = {g for g in existing if g}
+    missing: list[str] = []
+    seen: set[str] = set()
+    for name in referenced:
+        if name and name not in existing_set and name not in seen:
+            missing.append(name)
+            seen.add(name)
+    return missing
+
+
+def preflight_consume_groups(referenced, existing, *, create_groups: bool = False) -> None:
+    """Consume-by-default group-existence preflight.
+
+    In the default (consume) path, every referenced access-tier group must
+    already exist as an IdP-synced account group; otherwise raise
+    :class:`GroupPreflightError` naming the missing group(s) with an actionable
+    remediation. In the opt-in create/greenfield path (``create_groups=True``)
+    this is a no-op, since GenieRails mints the groups itself.
+    """
+    if create_groups:
+        return
+    missing = find_missing_idp_groups(referenced, existing)
+    if not missing:
+        return
+    bullets = "".join(f"    - {g}\n" for g in missing)
+    raise GroupPreflightError(
+        "IdP group preflight failed — the following access-tier group(s) are "
+        "referenced but are NOT synced from your identity provider into the "
+        "Databricks account:\n"
+        f"{bullets}"
+        "\nGenieRails consumes IdP-owned groups by default and does not create "
+        "them. To fix this:\n"
+        "  - Enable AIM (or SCIM where AIM is unavailable) so your IdP syncs "
+        "these groups into the account, then re-run; or\n"
+        "  - Pass the exact existing group names via --groups "
+        "'<tier1>,<tier2>,...' (the group->tier mapping); or\n"
+        "  - For a demo/greenfield deployment with no IdP, re-run with "
+        "--create-groups so GenieRails mints the groups (account layer "
+        "manage_groups = true)."
+    )
+
+
+def list_account_group_names(auth_cfg: dict) -> list[str] | None:
+    """Best-effort list of account-level group display names via the Databricks SDK.
+
+    Returns ``None`` (preflight is then skipped with a warning) when the SDK or
+    account credentials are unavailable, so generation still works offline / in
+    workspace-only setups. Returns a (possibly empty) list on success.
+    """
+    try:
+        from databricks.sdk import AccountClient
+    except Exception:
+        return None
+
+    host = auth_cfg.get("databricks_account_host")
+    account_id = auth_cfg.get("databricks_account_id")
+    client_id = auth_cfg.get("databricks_client_id")
+    client_secret = auth_cfg.get("databricks_client_secret")
+    if not (host and account_id and client_id and client_secret):
+        return None
+
+    try:
+        ac = AccountClient(
+            host=host,
+            account_id=account_id,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        return [g.display_name for g in ac.groups.list() if g.display_name]
+    except Exception as e:
+        print(f"  WARNING: Could not list account groups for IdP preflight: {e}")
+        return None
+
+
 def bootstrap_per_space_dirs(out_dir: Path, auth_cfg: dict, hcl_text: str) -> None:
     """After a full generation, extract each space's genie_space_configs entry
     and write it to generated/spaces/<key>/abac.auto.tfvars.
@@ -6224,11 +6344,26 @@ def main():
     parser.add_argument("--promote", action="store_true",
         help="Auto-split validated output into account + env data_access + workspace configs")
     parser.add_argument("--dry-run", action="store_true", help="Build the prompt and print it without calling the LLM")
-    parser.add_argument(
+    # --groups (consume) and --create-groups (invent) are mutually exclusive:
+    # you either point GenieRails at existing IdP-synced groups OR opt into
+    # minting new ones — never both (that would aim the create path at an
+    # IdP-owned group, i.e. mixed ownership). argparse rejects the combination.
+    group_mode = parser.add_mutually_exclusive_group()
+    group_mode.add_argument(
         "--groups",
-        help="Comma-separated group names to use in generated config. "
-             "When set, the LLM uses these exact names instead of inventing new ones. "
-             "Useful for IDP-synced groups (e.g. --groups 'Finance_Analyst,Clinical_Staff').",
+        help="Comma-separated existing group names to consume, one per access tier "
+             "(the group->tier mapping). When set, the LLM uses these exact IdP-synced "
+             "names instead of inventing new ones. This is the primary, expected input "
+             "for the default consume path (e.g. --groups 'Finance_Analyst,Clinical_Staff'). "
+             "Mutually exclusive with --create-groups.",
+    )
+    group_mode.add_argument(
+        "--create-groups",
+        action="store_true",
+        help="OPT-IN (demo/greenfield only): let the LLM invent access-tier group names "
+             "and have the account layer CREATE them (set manage_groups = true in "
+             "envs/account/env.auto.tfvars). Off by default — GenieRails consumes existing "
+             "IdP-synced groups and does not mint them. Mutually exclusive with --groups.",
     )
     parser.add_argument(
         "--space",
@@ -6341,6 +6476,9 @@ def main():
     # after writing we merge the new content back into generated/abac.auto.tfvars.
     target_space_cfg: dict | None = None
     space_key: str = ""
+    # Track whether the consumed group names came from account-config auto-load
+    # (vs. the literal --groups CLI arg) so we can label them accurately below.
+    groups_auto_loaded = False
 
     if args.space:
         genie_spaces_cfg_all = auth_cfg.get("genie_spaces", [])
@@ -6366,19 +6504,76 @@ def main():
         print(f"  Space key:  {space_key}")
         print(f"  Out dir:    {out_dir}")
 
-        # Auto-load existing groups from the account config so the LLM reuses them
-        if not args.groups:
+        # Auto-load existing groups from the account config so the LLM reuses
+        # them (consume path only — never in the opt-in --create-groups path).
+        if not args.groups and not args.create_groups:
             existing_groups = load_groups_from_account_config()
             if existing_groups:
                 args.groups = ",".join(existing_groups)
+                groups_auto_loaded = True
 
     # In genie mode, also auto-load groups from account config so the LLM knows
-    # which pre-existing groups are available for space ACLs.
-    if args.mode == "genie" and not args.space and not args.groups:
+    # which pre-existing groups are available for space ACLs (consume path only).
+    if args.mode == "genie" and not args.space and not args.groups and not args.create_groups:
         existing_groups = load_groups_from_account_config()
         if existing_groups:
             args.groups = ",".join(existing_groups)
+            groups_auto_loaded = True
             print(f"  Auto-loaded {len(existing_groups)} group(s) from account config (genie mode)")
+
+    # ── Resolve group-generation mode (consume-by-default) ───────────────────
+    # Done BEFORE any table fetch / LLM call so the default path can never
+    # silently invent groups. Two modes:
+    #   consume (DEFAULT): use the supplied group->tier mapping exactly; the
+    #     account layer looks these IdP-synced groups up (does not mint them).
+    #   create (--create-groups, opt-in demo/greenfield): the LLM invents names
+    #     and the account layer creates them (manage_groups = true).
+    group_names: list[str] | None = None
+    if args.groups:
+        group_names = [g.strip() for g in args.groups.split(",") if g.strip()]
+        src = "auto-loaded from account config" if groups_auto_loaded else "--groups CLI"
+        print(f"  Groups:   {', '.join(group_names)} ({src})")
+
+    if args.create_groups:
+        print("  Group mode: CREATE (opt-in demo/greenfield) — the LLM proposes "
+              "access-tier groups and the account layer will mint them; set "
+              "manage_groups = true in envs/account.")
+    elif not group_names:
+        # Consume mode with no mapping: refuse rather than let the LLM invent.
+        print(
+            "ERROR: consume-by-default requires a group->tier mapping.\n"
+            "  GenieRails consumes existing IdP-synced groups by default and will "
+            "not invent them.\n"
+            "  Fix one of:\n"
+            "    - Pass the existing group names, one per access tier, via "
+            "--groups '<tier1>,<tier2>,...'\n"
+            "      (e.g. make generate GENERATE_ARGS='--groups "
+            "\"Finance_Analyst,Clinical_Staff\"'); or\n"
+            "    - For a demo/greenfield account with no IdP-synced groups, opt in "
+            "with --create-groups\n"
+            "      (e.g. make generate GENERATE_ARGS='--create-groups') and set "
+            "manage_groups = true in envs/account."
+        )
+        sys.exit(1)
+    else:
+        # Consume mode with a mapping: verify every referenced access-tier group
+        # already exists as an IdP-synced account group. Runs on ALL consume
+        # paths (literal --groups and auto-loaded config names). A missing group
+        # fails loudly here instead of producing a grant that matches nobody.
+        # Skipped with a note only when account creds are unavailable, so
+        # offline / workspace-only generation still works.
+        existing = list_account_group_names(auth_cfg)
+        if existing is None:
+            print("  NOTE: skipping IdP group preflight — no account credentials "
+                  "available; ensure these groups are IdP-synced before apply.")
+        else:
+            try:
+                preflight_consume_groups(group_names, existing, create_groups=False)
+            except GroupPreflightError as e:
+                print(f"ERROR: {e}")
+                sys.exit(1)
+            print(f"  IdP preflight: all {len(group_names)} referenced group(s) "
+                  "found in the account.")
 
     catalog = args.catalog or ""
     schema = args.schema or ""
@@ -6518,11 +6713,8 @@ def main():
 
         ddl_text = load_ddl_files(ddl_dir)
 
-    group_names = None
-    if args.groups:
-        group_names = [g.strip() for g in args.groups.split(",") if g.strip()]
-        src = "auto-loaded from account config" if target_space_cfg is not None and not args.groups.startswith(args.groups) else "--groups CLI"
-        print(f"  Groups:   {', '.join(group_names)} ({src})")
+    # group_names + consume/create mode were resolved (and preflighted) above,
+    # before any table fetch, so the default path can never silently invent.
 
     # Collect space names from config so the LLM uses them verbatim as
     # genie_space_configs keys instead of inventing its own titles.
@@ -6552,6 +6744,7 @@ def main():
         mode=args.mode,
         countries=countries,
         industries=industries,
+        create_groups=args.create_groups,
     )
 
     if args.dry_run:

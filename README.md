@@ -88,3 +88,4 @@ genierails/
 - [CI/CD Integration](shared/docs/cicd.md) — validate and deploy from a pipeline
 - [Troubleshooting](shared/docs/troubleshooting.md) — imports, provider quirks, brownfield workflows
 - [Integration Testing](shared/docs/integration-testing.md) — unit tests, integration scenarios, test data
+- [Effective-Access Verification](shared/docs/effective-access-verification.md) — prove masking/row filters take effect by querying as per-tier test principals (`make verify-access`)

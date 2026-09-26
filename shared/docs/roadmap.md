@@ -84,18 +84,28 @@ No built-in metrics on masking function execution. Users can't tell if functions
 
 ## 5. Stronger Integration Test Assertions
 
-**Status:** Planned | **Effort:** Medium
+**Status:** Implemented | **Effort:** Medium
 
 Current integration tests check file existence and basic content. Missing: masking enforcement verification via actual SQL queries.
 
-**Design:**
-- After `make apply`, execute test queries as different groups to verify masking works:
-  - Query as `analyst` group → verify PII columns return masked values
-  - Query as `compliance` group → verify full access
-  - Query with row filter → verify restricted rows are hidden
-- Add `_verify_governance_effective()` helper to integration test framework
+**Delivered:** `shared/verify_effective_access.py` + `make verify-access`. It
+verifies masking and row filtering **by effect** — running the same query as a
+dedicated per-tier test service principal and comparing the values each tier
+gets back — rather than only checking that masks/tags exist. See
+[`effective-access-verification.md`](effective-access-verification.md).
 
-**Implementation notes:**
-- Requires creating test users or impersonating groups via SP
-- SQL queries against governed tables with `SELECT` + assertion on result format
-- Adds ~2-3 minutes per scenario but provides end-to-end confidence
+**Design (as built):**
+- After `make apply`, `make verify-access ENV=<env>` provisions one service
+  principal per access tier (each a member of that tier's group), runs `SELECT`
+  as each, and asserts:
+  - a lower-tier principal sees the **masked** value while a higher-tier
+    principal sees the **raw** value for the same row, and
+  - a row-filtered table returns **fewer rows** to a restricted principal.
+- The value-comparison logic is pure and unit-tested with mocked query results
+  (`tests/test_verify_effective_access.py`); the live workspace path is guarded
+  behind `--live` / `GENIERAILS_LIVE_VERIFY=1`.
+
+**Note:** Databricks has no general per-user query impersonation, so dedicated
+per-tier test principals are the mechanism (documented in the guide). Wiring
+`make verify-access` into the `run_integration_tests.py` scenarios as an
+automatic post-apply step is a follow-up.

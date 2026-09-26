@@ -1,8 +1,8 @@
 import json
 
 from generate_abac import (
-    coverage_denominator,
     discover_agent_footprint,
+    footprint_contains_column,
     footprint_table_refs,
     scope_ddl_to_footprint,
 )
@@ -45,19 +45,23 @@ def test_declared_footprint_fallback_for_new_space_is_deterministic():
     ]
 
 
-def test_coverage_denominator_uses_agent_footprint():
-    footprint = discover_agent_footprint(declared_footprint=[
-        {"table": "cat.sales.orders", "columns": ["email"]},
-    ])
-    assignments = [
-        {"entity_type": "columns", "entity_name": "cat.sales.orders.email", "tag_key": "pii", "tag_value": "email"},
-        {"entity_type": "columns", "entity_name": "cat.sales.orders.internal_note", "tag_key": "pii", "tag_value": "text"},
-        {"entity_type": "columns", "entity_name": "cat.hr.people.ssn", "tag_key": "pii", "tag_value": "ssn"},
-    ]
+def test_wildcard_footprint_keeps_concrete_column_in_scan_denominator():
+    footprint = discover_agent_footprint(
+        declared_footprint=["dev_catalog.finance.*"]
+    )
 
-    assert [item["entity_name"] for item in coverage_denominator(assignments, footprint)] == [
-        "cat.sales.orders.email"
-    ]
+    assert footprint_contains_column(
+        footprint, "dev_catalog.finance.invoices.email"
+    )
+
+
+def test_footprint_column_matching_is_case_insensitive():
+    footprint = discover_agent_footprint(declared_footprint=[
+        {"table": "Cat.Schema.Orders", "columns": ["Email"]},
+    ])
+
+    assert footprint_contains_column(footprint, "cat.schema.orders.email")
+    assert not footprint_contains_column(footprint, "cat.schema.orders.internal_note")
 
 
 def test_explicit_columns_bound_fetched_ddl_scan_scope():
@@ -73,3 +77,17 @@ def test_explicit_columns_bound_fetched_ddl_scan_scope():
     assert "email STRING" in scoped
     assert "id BIGINT" in scoped
     assert "internal_note" not in scoped
+
+
+def test_explicit_ddl_column_scope_is_case_insensitive():
+    ddl = """CREATE TABLE cat.schema.orders (
+  Email STRING,
+  Internal_Note STRING
+);"""
+    footprint = discover_agent_footprint(declared_footprint=[
+        {"table": "Cat.Schema.Orders", "columns": ["email"]},
+    ])
+
+    scoped = scope_ddl_to_footprint(ddl, footprint)
+    assert "Email STRING" in scoped
+    assert "Internal_Note" not in scoped

@@ -456,6 +456,7 @@ def discover_agent_footprint(
         if normalized_columns:
             tables[table].update(normalized_columns)
         else:
+            # A whole-table declaration supersedes any named columns for it.
             whole_table.add(table)
 
     for entry in declared_footprint or []:
@@ -512,40 +513,21 @@ def footprint_contains_column(footprint: list[dict], column_fqn: str) -> bool:
     parts = column_fqn.split(".")
     if len(parts) != 4:
         return False
-    table, column = ".".join(parts[:3]), parts[3]
+    table, column = ".".join(parts[:3]).lower(), parts[3].lower()
     for entry in footprint:
-        if entry.get("table") == table:
-            columns = entry.get("columns") or []
+        footprint_table = str(entry.get("table") or "").lower()
+        if footprint_table.endswith(".*") and table.startswith(footprint_table[:-1]):
+            return True
+        if footprint_table == table:
+            columns = [str(value).lower() for value in (entry.get("columns") or [])]
             return not columns or column in columns
     return False
-
-
-def coverage_denominator(assignments: list[dict], footprint: list[dict]) -> list[dict]:
-    """Return classified columns reachable by this agent, in stable order.
-
-    The coverage gate's rules remain unchanged; this helper only supplies its
-    agent-bounded universe instead of allowing unrelated metastore fields into
-    the denominator.
-    """
-    scoped = [
-        item for item in assignments
-        if item.get("entity_type") == "columns"
-        and footprint_contains_column(footprint, item.get("entity_name", ""))
-    ]
-    return sorted(
-        scoped,
-        key=lambda item: (
-            item.get("entity_name", "").lower(),
-            item.get("tag_key", "").lower(),
-            item.get("tag_value", "").lower(),
-        ),
-    )
 
 
 def scope_ddl_to_footprint(ddl_text: str, footprint: list[dict]) -> str:
     """Restrict fetched DDL columns to the canonical footprint when explicit."""
     explicit = {
-        item["table"]: set(item.get("columns") or [])
+        str(item["table"]).lower(): {str(column).lower() for column in (item.get("columns") or [])}
         for item in footprint if item.get("table") and item.get("columns")
     }
     if not explicit:
@@ -556,14 +538,20 @@ def scope_ddl_to_footprint(ddl_text: str, footprint: list[dict]) -> str:
     )
 
     def replace(match: re.Match) -> str:
-        table = ".".join(part.strip("`") for part in match.group(2).split("."))
+        table = ".".join(part.strip("`") for part in match.group(2).split(".")).lower()
         wanted = explicit.get(table)
+        if wanted is None:
+            wanted = next(
+                (columns for name, columns in explicit.items()
+                 if name.endswith(".*") and table.startswith(name[:-1])),
+                None,
+            )
         if not wanted:
             return match.group(0)
         kept = []
         for line in match.group(3).splitlines():
             name = line.strip().lstrip(",").split(None, 1)[0].strip("`,") if line.strip() else ""
-            if name in wanted:
+            if name.lower() in wanted:
                 kept.append(line)
         body = "\n" + "\n".join(kept) + "\n"
         return match.group(1) + body + match.group(4)

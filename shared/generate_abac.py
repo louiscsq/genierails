@@ -50,6 +50,21 @@ import time
 from pathlib import Path
 
 from tag_vocabulary import REGISTRY
+from sensitivity_source import (
+    ClassificationScan,
+    Finding,
+    LLMSource,
+    LLM as _SRC_LLM,
+    SensitivitySource,
+    classification_decision,
+    scan_from_run_sql,
+    select_findings,
+    DECISION_USE_CLASSIFICATION,
+    DECISION_USE_LLM,
+    DECISION_FAIL_CLOSED,
+    SCAN_UNAVAILABLE,
+    SCAN_ERROR,
+)
 
 PRODUCT_NAME = "genierails"
 PRODUCT_VERSION = "0.1.0"
@@ -1661,6 +1676,127 @@ def _fetch_live_tag_policy_values() -> dict[str, set[str]]:
         return {}
 
 
+def _scan_native_classification(
+    table_refs: list[str] | None,
+    auth_cfg: dict,
+) -> ClassificationScan:
+    """Scan native UC Data Classification and return a DISTINCT, fail-closed state.
+
+    Queries ``system.information_schema.column_tags`` (``class.*`` namespace) —
+    and ``system.data_classification.results`` when present — through a SQL
+    warehouse, using the same statement-execution pattern as
+    scripts/audit_schema_drift.py.
+
+    Unlike a best-effort ``None``, the returned :class:`ClassificationScan`
+    distinguishes *classified* from *scan-unavailable* (no warehouse / no
+    concrete tables / connection failure) from *scan-error* (the read failed).
+    A completed scan with no ``class.*`` tags is :data:`SCAN_NO_TAGS`.  The
+    caller decides via :func:`classification_decision` and MUST fail closed on
+    the inconclusive states — this function never masks them as "nothing
+    sensitive".
+    """
+    table_fqns = [
+        r for r in (table_refs or [])
+        if len(str(r).split(".")) == 3 and "*" not in str(r)
+    ]
+    if not table_fqns:
+        return ClassificationScan(
+            SCAN_UNAVAILABLE, None, "no concrete catalog.schema.table refs to scan"
+        )
+    try:
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.sql import StatementState
+
+        configure_databricks_env(auth_cfg)
+        w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+
+        warehouse_id = str(auth_cfg.get("sql_warehouse_id") or "").strip()
+        if not warehouse_id:
+            for wh in w.warehouses.list():
+                if wh.id:
+                    warehouse_id = wh.id
+                    break
+        if not warehouse_id:
+            return ClassificationScan(
+                SCAN_UNAVAILABLE, None, "no SQL warehouse available to run the scan"
+            )
+
+        def _run_sql(sql: str) -> list:
+            r = w.statement_execution.execute_statement(
+                statement=sql, warehouse_id=warehouse_id, wait_timeout="50s",
+            )
+            while r.status and r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+                time.sleep(2)
+                r = w.statement_execution.get_statement(r.statement_id)
+            if r.status and r.status.state == StatementState.FAILED:
+                err = getattr(r.status, "error", None)
+                msg = getattr(err, "message", str(err)) if err else "unknown"
+                raise RuntimeError(msg)
+            if r.result and r.result.data_array:
+                return r.result.data_array
+            return []
+
+        # scan_from_run_sql turns a failed column_tags read into SCAN_ERROR.
+        return scan_from_run_sql(_run_sql, table_fqns)
+    except Exception as exc:
+        return ClassificationScan(SCAN_ERROR, None, f"could not connect / scan: {exc}")
+
+
+def _resolve_classification_source(
+    table_refs: list[str] | None,
+    auth_cfg: dict,
+    mode: str,
+    allow_llm_sensitivity: bool,
+) -> SensitivitySource | None:
+    """Scan native classification and apply the fail-closed decision.
+
+    This is the wiring main() relies on, factored out so it is unit-testable:
+    scan → :func:`classification_decision` → act.
+
+    * ``DECISION_USE_CLASSIFICATION`` → return the authoritative source.
+    * ``DECISION_FAIL_CLOSED`` (inconclusive scan, no opt-in) → log the DISTINCT
+      state and abort the process with ``exit code 3``.
+    * ``DECISION_USE_LLM`` (explicit opt-in) → return ``None`` (LLM fallback),
+      logging the distinct unverified state rather than masking it.
+
+    In ``genie`` mode tag_assignments are governance-owned, so no scan runs and
+    ``None`` is returned unconditionally.
+    """
+    if mode == "genie":
+        return None
+
+    scan = _scan_native_classification(table_refs, auth_cfg)
+    decision = classification_decision(scan, allow_llm_sensitivity)
+
+    if decision == DECISION_USE_CLASSIFICATION:
+        print(
+            "  [SENSITIVITY] Native UC Data Classification is authoritative "
+            f"({scan.detail})"
+        )
+        return scan.source
+
+    if decision == DECISION_FAIL_CLOSED:
+        fatal = scan.state in (SCAN_UNAVAILABLE, SCAN_ERROR)
+        print(
+            "  [SENSITIVITY] FAIL-CLOSED: native classification could not be "
+            f"confirmed (state={scan.state}: {scan.detail}). Sensitivity was NOT "
+            "natively verified, so LLM/DDL inference is UNTRUSTED. Re-run against a "
+            "working SQL warehouse with UC Data Classification, or pass "
+            "--allow-llm-sensitivity / GENIERAILS_ALLOW_LLM_SENSITIVITY=1 to accept "
+            "LLM-inferred sensitivity."
+            + ("" if fatal else " (A clean scan found no class.* tags — the tables "
+               "may not be classified yet.)")
+        )
+        sys.exit(3)
+
+    # DECISION_USE_LLM — explicit opt-in; surface the distinct state, don't mask it.
+    print(
+        "  [SENSITIVITY] Proceeding with LLM/DDL-inferred sensitivity "
+        f"(UNVERIFIED, opt-in): native scan state={scan.state} ({scan.detail})"
+    )
+    return None
+
+
 def autofix_tag_policies(tfvars_path: Path) -> int:
     """Add tag values used in assignments/policies but missing from tag_policies.
 
@@ -1899,6 +2035,57 @@ def remove_stale_assignments(tfvars_path: Path, stale_entities: list[str]) -> in
     if removed:
         tfvars_path.write_text(text)
     return removed
+
+
+def _remove_column_assignment_blocks(text: str, entities: list[str]) -> tuple[str, int]:
+    """Remove every tag_assignment block whose entity_name is in ``entities``.
+
+    Pure text transform (no file I/O) so callers already holding the file text
+    in memory can override assignments before re-injecting.  Returns
+    ``(new_text, removed_count)``.  entity_name is matched exactly, so a 4-part
+    column FQN never collides with a 3-part table assignment.
+    """
+    removed = 0
+    for entity in entities:
+        pattern = re.compile(r'entity_name\s*=\s*"' + re.escape(entity) + r'"')
+        while True:
+            m = pattern.search(text)
+            if not m:
+                break
+            pos = m.start()
+            block_start = None
+            i = pos - 1
+            while i >= 0:
+                if text[i] == "{":
+                    block_start = i
+                    break
+                i -= 1
+            if block_start is None:
+                break
+            block_end = None
+            depth = 1
+            j = pos
+            while j < len(text):
+                if text[j] == "{":
+                    depth += 1
+                elif text[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        block_end = j + 1
+                        break
+                j += 1
+            if block_end is None:
+                break
+            trail = block_end
+            while trail < len(text) and text[trail] in (" ", "\t"):
+                trail += 1
+            if trail < len(text) and text[trail] == ",":
+                trail += 1
+            while trail < len(text) and text[trail] in ("\n", "\r"):
+                trail += 1
+            text = text[:block_start] + text[trail:]
+            removed += 1
+    return text, removed
 
 
 def autofix_undefined_tag_refs(tfvars_path: Path) -> int:
@@ -5054,6 +5241,7 @@ def autofix_untagged_pii_columns(
     tfvars_path: Path,
     ddl_path: Path | None = None,
     sql_path: Path | None = None,
+    classification_source: SensitivitySource | None = None,
 ) -> int:
     """Detect PII/sensitive columns in the DDL that the LLM forgot to tag.
 
@@ -5061,6 +5249,15 @@ def autofix_untagged_pii_columns(
     adds tag_assignment entries for any that are missing.  This prevents the
     common failure where the LLM generates groups and policies but omits
     tag assignments for obvious columns like email, phone, or address.
+
+    Sensitivity per column is resolved through the :class:`SensitivitySource`
+    interface: when ``classification_source`` supplies native UC Data
+    Classification (``class.*``) findings for a column, those are authoritative;
+    otherwise the deterministic DDL name-pattern inference (the LLM path's
+    backstop, wrapped as :class:`LLMSource`) decides.  Every added assignment is
+    logged with the source that produced it.  When ``classification_source`` is
+    ``None`` (the default), the result is identical to the legacy name-pattern
+    behaviour.
 
     Returns the number of tag assignments added.
     """
@@ -5146,28 +5343,102 @@ def autofix_untagged_pii_columns(
     if "mask_amount_rounded" in available_fns:
         active_patterns.extend(_FINANCIAL_COLUMN_TAG_MAP)
 
-    # Check each column against PII patterns
-    new_assignments: list[dict] = []
-    for full_name, col_name in all_columns:
-        if full_name in existing_tags:
-            continue
-        for hints, tag_key, tag_value in active_patterns:
-            if col_name in hints or any(h in col_name for h in hints):
-                new_assignments.append({
-                    "entity_type": "columns",
-                    "entity_name": full_name,
-                    "tag_key": tag_key,
-                    "tag_value": tag_value,
-                })
-                break  # first match wins
+    # Resolve each column's sensitivity through the SensitivitySource interface.
+    # The deterministic DDL name-pattern matcher below is the LLM path's backstop
+    # (LLMSource); native classification, when supplied, is AUTHORITATIVE.
+    col_name_by_full = dict(all_columns)
+    all_col_names = [full for full, _ in all_columns]
 
-    if not new_assignments:
+    # Native classification OVERRIDES any pre-existing (LLM-generated) assignment
+    # for the same column — so it is authoritative, not merely gap-filling.  Any
+    # natively-claimed column that already has an assignment has that assignment
+    # removed here, so the native finding (or, for an unmapped class, no tag at
+    # all) replaces it.  The LLM remains the fallback ONLY for columns with no
+    # native classification.
+    native_claimed = (
+        classification_source.claimed_columns(all_col_names)
+        if classification_source is not None else set()
+    )
+    override_cols = sorted(native_claimed & existing_tags)
+    overridden_removed = 0
+    if override_cols:
+        text, overridden_removed = _remove_column_assignment_blocks(text, override_cols)
+        existing_tags -= set(override_cols)
+        for col in override_cols:
+            print(
+                f"  [SENSITIVITY] Native classification overrides pre-existing "
+                f"assignment for {col}"
+            )
+
+    # Candidates: every natively-claimed column (classification decides / clears
+    # it) plus every still-untagged column (LLM fallback).
+    candidate_columns = [
+        full for full in all_col_names
+        if full in native_claimed or full not in existing_tags
+    ]
+
+    def _ddl_pattern_infer(cols: list[str]) -> list[Finding]:
+        out: list[Finding] = []
+        for full_name in cols:
+            col_name = col_name_by_full.get(full_name, full_name.split(".")[-1].lower())
+            for hints, tag_key, tag_value in active_patterns:
+                if col_name in hints or any(h in col_name for h in hints):
+                    out.append(Finding(
+                        entity_name=full_name,
+                        tag_key=tag_key,
+                        tag_value=tag_value,
+                        source=_SRC_LLM,
+                        detail=col_name,
+                    ))
+                    break  # first match wins
+        return out
+
+    llm_source = LLMSource(_ddl_pattern_infer)
+    findings = select_findings(candidate_columns, classification_source, llm_source)
+
+    # Route EVERY finding (classification and LLM alike) through the same
+    # covering-function check, so no source can introduce a tag_value that has
+    # no masking function to cover it.  LLM findings are already pre-filtered via
+    # active_patterns, so in practice this only ever drops an uncovered
+    # classification value.
+    covered_findings: list[Finding] = []
+    for f in findings:
+        if _any_covering_fn_available(f.tag_value):
+            covered_findings.append(f)
+        else:
+            print(
+                f"  [SENSITIVITY] Skipped {f.source} tag for {f.entity_name} "
+                f"({f.tag_key} = '{f.tag_value}'): no covering masking function available"
+            )
+    findings = covered_findings
+
+    # Surface natively-classified columns we could not tag (unmapped class.*
+    # semantic), so a reviewer / coverage gate sees that authority was claimed
+    # but no governed tag applied.  These columns are still NOT handed to the LLM
+    # (select_findings claimed them), preventing a silent LLM override.
+    if classification_source is not None and hasattr(classification_source, "unmapped_columns"):
+        for entity_name, semantic in classification_source.unmapped_columns(candidate_columns):
+            print(
+                f"  [SENSITIVITY] Column {entity_name} carries native "
+                f"class.{semantic} with no governed mapping — left untagged "
+                "(LLM override suppressed)"
+            )
+
+    if not findings:
+        # Persist any override removals even when nothing new is injected, so a
+        # native override that cleared an LLM assignment isn't silently lost.
+        if overridden_removed:
+            tfvars_path.write_text(text)
         return 0
+
+    new_assignments: list[dict] = [f.as_assignment() for f in findings]
 
     # Inject new tag assignments into the HCL text
     # Find the tag_assignments section and append before the closing ]
     ta_section = re.search(r"(tag_assignments\s*=\s*\[)(.*?)(\])", text, re.DOTALL)
     if not ta_section:
+        if overridden_removed:
+            tfvars_path.write_text(text)
         return 0
 
     insert_pos = ta_section.end(2)  # before the ]
@@ -5183,17 +5454,20 @@ def autofix_untagged_pii_columns(
         insert_pos = ta_section.end(2)
 
     lines = []
-    for ta in new_assignments:
+    for f in findings:
         lines.append(
-            f'  {{ entity_type = "columns", entity_name = "{ta["entity_name"]}", '
-            f'tag_key = "{ta["tag_key"]}", tag_value = "{ta["tag_value"]}" }},'
+            f'  {{ entity_type = "columns", entity_name = "{f.entity_name}", '
+            f'tag_key = "{f.tag_key}", tag_value = "{f.tag_value}" }},'
         )
-        print(f"  [AUTOFIX] Added tag_assignment: {ta['entity_name']} ({ta['tag_key']} = '{ta['tag_value']}')")
+        print(
+            f"  [AUTOFIX] Added tag_assignment: {f.entity_name} "
+            f"({f.tag_key} = '{f.tag_value}') [source: {f.source}]"
+        )
 
     injection = "\n" + "\n".join(lines) + "\n"
     text = text[:insert_pos] + injection + text[insert_pos:]
     tfvars_path.write_text(text)
-    return len(new_assignments)
+    return len(findings)
 
 
 def autofix_remove_uncovered_tags(tfvars_path: Path, sql_path: Path | None = None) -> int:
@@ -6206,6 +6480,17 @@ def main():
         help="Output directory for generated files (default: ./generated/)",
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Max LLM call attempts with exponential backoff (default: 3)")
+    parser.add_argument(
+        "--allow-llm-sensitivity",
+        action="store_true",
+        default=os.environ.get("GENIERAILS_ALLOW_LLM_SENSITIVITY", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Allow LLM/DDL-inferred sensitivity when native UC Data Classification "
+            "could not be confirmed (scan unavailable/errored, or no class.* tags). "
+            "Default: FAIL CLOSED — abort rather than silently trust LLM inference. "
+            "Can also be set via GENIERAILS_ALLOW_LLM_SENSITIVITY=1."
+        ),
+    )
     parser.add_argument("--skip-validation", action="store_true", help="Skip running validate_abac.py")
     parser.add_argument("--promote", action="store_true",
         help="Auto-split validated output into account + env data_access + workspace configs")
@@ -6822,12 +7107,24 @@ Before you apply, tune for your business roles, security requirements, and Genie
         if n_overlay_fns:
             print(f"  Auto-fixed: injected {n_overlay_fns} overlay-provided masking function(s)")
 
+        # Resolve the sensitivity source once, FAILING CLOSED.  Native UC Data
+        # Classification (class.* tags) is authoritative when present.  When the
+        # scan is inconclusive — unavailable, errored, or a clean read with no
+        # class.* tags — we do NOT silently trust LLM/DDL inference: the run
+        # aborts (exit 3) unless --allow-llm-sensitivity (or
+        # GENIERAILS_ALLOW_LLM_SENSITIVITY) explicitly downgrades it to an LLM
+        # fallback.  See _resolve_classification_source.
+        classification_source = _resolve_classification_source(
+            table_refs, auth_cfg, args.mode, args.allow_llm_sensitivity,
+        )
+
         # Skip PII autofix in genie mode — tag_assignments are managed by the governance team
         if args.mode != "genie":
             n_pii_tags = autofix_untagged_pii_columns(
                 tfvars_path,
                 ddl_path=out_dir / "ddl" / "_fetched.sql" if out_dir else None,
                 sql_path=sql_path if sql_block else None,
+                classification_source=classification_source,
             )
             if n_pii_tags:
                 print(f"  Auto-fixed: added {n_pii_tags} tag_assignment(s) for untagged PII columns")
@@ -7087,6 +7384,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                             tfvars_path,
                             ddl_path=out_dir / "ddl" / "_fetched.sql" if out_dir else None,
                             sql_path=sql_path if sql_block else None,
+                            classification_source=classification_source,
                         )
                         autofix_tag_policies(tfvars_path)  # register new PII tag values
                     autofix_missing_fgac_policies(tfvars_path, sql_path if sql_block else None)

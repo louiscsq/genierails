@@ -1,5 +1,6 @@
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -204,6 +205,9 @@ audit-schema: _bootstrap _guard-workspace-target ## Report untagged sensitive co
 evidence: _bootstrap _guard-workspace-target ## Emit JSON and Markdown compliance evidence (set GENIERAILS_EVIDENCE_INTEGRATION=1 for live state)
 	@echo "=== Compliance Evidence ($(ENV)) ==="
 	@cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/evidence_report.py" $(if $(WAREHOUSE_ID),--warehouse-id "$(WAREHOUSE_ID)",)
+audit-rulebook: _bootstrap _guard-workspace-target ## Report prod-applied tags (class.* + governed keys) with no covering policy or mask
+	@echo "=== Rulebook Drift Audit ($(ENV)) ==="
+	@cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/audit_schema_drift.py" --mode rulebook
 
 generate-delta: _bootstrap _guard-workspace-target ## Detect schema drift and generate incremental tag_assignments (constrained to existing governed keys/values)
 	@echo "=== Generate Delta ($(ENV)) ==="

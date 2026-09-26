@@ -16,16 +16,6 @@ terraform {
   }
 }
 
-data "databricks_group" "existing" {
-  for_each = var.groups
-
-  # Data-access principals must be resolvable in the workspace where grants
-  # and policies are applied. Account groups assigned to this workspace are
-  # visible here; workspace-local groups are not valid Unity Catalog principals.
-  provider     = databricks.workspace
-  display_name = each.key
-}
-
 locals {
   effective_warehouse_id = (
     var.sql_warehouse_id != ""

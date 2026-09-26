@@ -1,5 +1,12 @@
 {
   "families": {
+    "gr_treatment": {
+      "canonical_key": "gr.treatment",
+      "description": "GenieRails-owned, derived enforcement treatment.",
+      "canonical_values": ["redact", "ssn_last4", "card_last4", "account_last4", "email_partial", "phone_partial", "name_partial", "date_year", "tfn_partial", "medicare_partial", "bsb_partial", "aadhaar_partial", "generic_partial", "round_amount"],
+      "key_aliases": [],
+      "value_aliases": {}
+    },
     "pii_level": {
       "canonical_key": "pii_level",
       "description": "Canonical vocabulary for PII sensitivity and masking tiers.",

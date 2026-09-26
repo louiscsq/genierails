@@ -530,6 +530,10 @@ def scope_ddl_to_footprint(ddl_text: str, footprint: list[dict]) -> str:
         str(item["table"]).lower(): {str(column).lower() for column in (item.get("columns") or [])}
         for item in footprint if item.get("table") and item.get("columns")
     }
+    whole_tables = {
+        str(item["table"]).lower()
+        for item in footprint if item.get("table") and not item.get("columns")
+    }
     if not explicit:
         return ddl_text
     pattern = re.compile(
@@ -539,13 +543,12 @@ def scope_ddl_to_footprint(ddl_text: str, footprint: list[dict]) -> str:
 
     def replace(match: re.Match) -> str:
         table = ".".join(part.strip("`") for part in match.group(2).split(".")).lower()
+        if table in whole_tables or any(
+            name.endswith(".*") and table.startswith(name[:-1])
+            for name in whole_tables | set(explicit)
+        ):
+            return match.group(0)
         wanted = explicit.get(table)
-        if wanted is None:
-            wanted = next(
-                (columns for name, columns in explicit.items()
-                 if name.endswith(".*") and table.startswith(name[:-1])),
-                None,
-            )
         if not wanted:
             return match.group(0)
         kept = []

@@ -91,3 +91,51 @@ def test_explicit_ddl_column_scope_is_case_insensitive():
     scoped = scope_ddl_to_footprint(ddl, footprint)
     assert "Email STRING" in scoped
     assert "Internal_Note" not in scoped
+
+
+def _assert_scope_matches_membership(footprint, expected_columns):
+    ddl = """CREATE TABLE cat.s.t (
+  email STRING,
+  ssn STRING
+);"""
+    scoped = scope_ddl_to_footprint(ddl, footprint)
+    for column in ("email", "ssn"):
+        kept = f"{column} STRING" in scoped
+        reachable = footprint_contains_column(footprint, f"cat.s.t.{column}")
+        assert kept == reachable
+        assert kept == (column in expected_columns)
+
+
+def test_wildcard_plus_explicit_columns_keeps_all_columns_consistently():
+    footprint = discover_agent_footprint(declared_footprint=[
+        "cat.s.*",
+        {"table": "cat.s.t", "columns": ["email"]},
+    ])
+
+    _assert_scope_matches_membership(footprint, {"email", "ssn"})
+
+
+def test_whole_table_plus_explicit_columns_keeps_all_columns_consistently():
+    footprint = discover_agent_footprint(declared_footprint=[
+        "cat.s.t",
+        {"table": "cat.s.t", "columns": ["email"]},
+    ])
+
+    _assert_scope_matches_membership(footprint, {"email", "ssn"})
+
+
+def test_explicit_columns_only_narrows_columns_consistently():
+    footprint = discover_agent_footprint(declared_footprint=[
+        {"table": "cat.s.t", "columns": ["email"]},
+    ])
+
+    _assert_scope_matches_membership(footprint, {"email"})
+
+
+def test_case_insensitive_wildcard_mix_keeps_all_columns_consistently():
+    footprint = discover_agent_footprint(declared_footprint=[
+        "CAT.S.*",
+        {"table": "Cat.S.T", "columns": ["EMAIL"]},
+    ])
+
+    _assert_scope_matches_membership(footprint, {"email", "ssn"})

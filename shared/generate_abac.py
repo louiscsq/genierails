@@ -5814,6 +5814,100 @@ def load_groups_from_account_config() -> list[str]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# IdP group preflight (consume-by-default)
+#
+# GenieRails consumes existing IdP-synced access-tier groups by default and does
+# not mint them. Before we hand a group->tier mapping to Terraform, verify every
+# referenced group actually exists as an account-level (IdP-synced) group, so a
+# typo or an un-synced group fails loudly here instead of silently producing a
+# grant that matches nobody.
+# ---------------------------------------------------------------------------
+class GroupPreflightError(RuntimeError):
+    """Raised when a referenced access-tier group is not synced from the IdP."""
+
+
+def find_missing_idp_groups(referenced, existing) -> list[str]:
+    """Return the referenced group names that are absent from ``existing``.
+
+    Pure helper: comparison is exact on display name. ``existing`` is any
+    iterable of account-level group display names. Order and de-duplication of
+    the returned list follow first appearance in ``referenced``.
+    """
+    existing_set = {g for g in existing if g}
+    missing: list[str] = []
+    seen: set[str] = set()
+    for name in referenced:
+        if name and name not in existing_set and name not in seen:
+            missing.append(name)
+            seen.add(name)
+    return missing
+
+
+def preflight_consume_groups(referenced, existing, *, create_groups: bool = False) -> None:
+    """Consume-by-default group-existence preflight.
+
+    In the default (consume) path, every referenced access-tier group must
+    already exist as an IdP-synced account group; otherwise raise
+    :class:`GroupPreflightError` naming the missing group(s) with an actionable
+    remediation. In the opt-in create/greenfield path (``create_groups=True``)
+    this is a no-op, since GenieRails mints the groups itself.
+    """
+    if create_groups:
+        return
+    missing = find_missing_idp_groups(referenced, existing)
+    if not missing:
+        return
+    bullets = "".join(f"    - {g}\n" for g in missing)
+    raise GroupPreflightError(
+        "IdP group preflight failed — the following access-tier group(s) are "
+        "referenced but are NOT synced from your identity provider into the "
+        "Databricks account:\n"
+        f"{bullets}"
+        "\nGenieRails consumes IdP-owned groups by default and does not create "
+        "them. To fix this:\n"
+        "  - Enable AIM (or SCIM where AIM is unavailable) so your IdP syncs "
+        "these groups into the account, then re-run; or\n"
+        "  - Pass the exact existing group names via --groups "
+        "'<tier1>,<tier2>,...' (the group->tier mapping); or\n"
+        "  - For a demo/greenfield deployment with no IdP, re-run with "
+        "--create-groups so GenieRails mints the groups (account layer "
+        "manage_groups = true)."
+    )
+
+
+def list_account_group_names(auth_cfg: dict) -> list[str] | None:
+    """Best-effort list of account-level group display names via the Databricks SDK.
+
+    Returns ``None`` (preflight is then skipped with a warning) when the SDK or
+    account credentials are unavailable, so generation still works offline / in
+    workspace-only setups. Returns a (possibly empty) list on success.
+    """
+    try:
+        from databricks.sdk import AccountClient
+    except Exception:
+        return None
+
+    host = auth_cfg.get("databricks_account_host")
+    account_id = auth_cfg.get("databricks_account_id")
+    client_id = auth_cfg.get("databricks_client_id")
+    client_secret = auth_cfg.get("databricks_client_secret")
+    if not (host and account_id and client_id and client_secret):
+        return None
+
+    try:
+        ac = AccountClient(
+            host=host,
+            account_id=account_id,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        return [g.display_name for g in ac.groups.list() if g.display_name]
+    except Exception as e:
+        print(f"  WARNING: Could not list account groups for IdP preflight: {e}")
+        return None
+
+
 def bootstrap_per_space_dirs(out_dir: Path, auth_cfg: dict, hcl_text: str) -> None:
     """After a full generation, extract each space's genie_space_configs entry
     and write it to generated/spaces/<key>/abac.auto.tfvars.
@@ -6375,9 +6469,19 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Build the prompt and print it without calling the LLM")
     parser.add_argument(
         "--groups",
-        help="Comma-separated group names to use in generated config. "
-             "When set, the LLM uses these exact names instead of inventing new ones. "
-             "Useful for IDP-synced groups (e.g. --groups 'Finance_Analyst,Clinical_Staff').",
+        help="Comma-separated existing group names to consume, one per access tier "
+             "(the group->tier mapping). When set, the LLM uses these exact IdP-synced "
+             "names instead of inventing new ones. This is the primary, expected input "
+             "for the default consume path (e.g. --groups 'Finance_Analyst,Clinical_Staff').",
+    )
+    parser.add_argument(
+        "--create-groups",
+        action="store_true",
+        help="OPT-IN (demo/greenfield only): let the LLM invent access-tier group names "
+             "and have the account layer CREATE them (set manage_groups = true in "
+             "envs/account/env.auto.tfvars). Off by default — GenieRails consumes existing "
+             "IdP-synced groups and does not mint them. When off, referenced groups are "
+             "preflighted against the account and a missing group fails loudly.",
     )
     parser.add_argument(
         "--space",
@@ -6661,6 +6765,26 @@ def main():
         group_names = [g.strip() for g in args.groups.split(",") if g.strip()]
         src = "auto-loaded from account config" if target_space_cfg is not None and not args.groups.startswith(args.groups) else "--groups CLI"
         print(f"  Groups:   {', '.join(group_names)} ({src})")
+
+    # ── IdP group preflight (consume-by-default) ────────────────────────────
+    # GenieRails consumes existing IdP-synced groups by default; it does not
+    # mint them. Verify every referenced access-tier group already exists in the
+    # account so a missing/un-synced group fails loudly here rather than
+    # producing a grant that matches nobody. Skipped in the opt-in --create-groups
+    # (demo/greenfield) path, and skipped with a note when account creds are
+    # unavailable so offline/workspace-only generation still works.
+    if group_names and not args.create_groups:
+        existing = list_account_group_names(auth_cfg)
+        if existing is None:
+            print("  NOTE: skipping IdP group preflight — no account credentials "
+                  "available; ensure these groups are IdP-synced before apply.")
+        else:
+            preflight_consume_groups(group_names, existing, create_groups=False)
+            print(f"  IdP preflight: all {len(group_names)} referenced group(s) "
+                  "found in the account.")
+    elif args.create_groups:
+        print("  Group mode: CREATE (opt-in demo/greenfield) — the account layer "
+              "will mint groups; set manage_groups = true in envs/account.")
 
     # Collect space names from config so the LLM uses them verbatim as
     # genie_space_configs keys instead of inventing its own titles.

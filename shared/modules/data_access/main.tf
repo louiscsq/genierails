@@ -19,7 +19,10 @@ terraform {
 data "databricks_group" "existing" {
   for_each = var.groups
 
-  provider     = databricks.account
+  # Data-access principals must be resolvable in the workspace where grants
+  # and policies are applied. This supports both account groups assigned to the
+  # workspace and disposable workspace-local groups used by CLI-profile flows.
+  provider     = databricks.workspace
   display_name = each.key
 }
 
@@ -91,7 +94,10 @@ resource "time_sleep" "wait_for_tag_propagation" {
 }
 
 resource "databricks_grant" "terraform_sp_manage_catalog" {
-  for_each = toset(local.all_catalogs)
+  # User/CLI-profile authentication has no service-principal client ID and the
+  # active user already carries their own privileges. Avoid an invalid grant to
+  # the empty-string principal in that supported path.
+  for_each = var.databricks_client_id != "" ? toset(local.all_catalogs) : toset([])
 
   provider   = databricks.workspace
   catalog    = each.value

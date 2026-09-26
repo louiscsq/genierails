@@ -337,9 +337,9 @@ class TestAutofixIntegration:
         assert "[source: classification]" in out
         assert "[source: llm]" in out
 
-    def test_classification_finding_dropped_when_uncovered(self, tmp_path, capsys):
-        # A classification value with no covering masking function must NOT be
-        # injected — it goes through the SAME coverage check as the LLM path.
+    def test_classification_finding_preserved_when_uncovered(self, tmp_path, capsys):
+        # An authoritative classification finding must remain visible so the
+        # blocking coverage gate can reject the missing protection.
         import generate_abac
         tfvars = tmp_path / "abac.auto.tfvars"
         tfvars.write_text(_TFVARS)
@@ -359,14 +359,12 @@ class TestAutofixIntegration:
         added = generate_abac.autofix_untagged_pii_columns(
             tfvars, ddl_path=ddl, sql_path=sql, classification_source=classification,
         )
-        # nothing added: classification's masked_dob is uncovered and dropped,
-        # and the LLM is suppressed on that (natively-classified) column.
-        assert added == 0
+        assert added == 1
         cfg = assert_valid_hcl(tfvars)
-        assert not any(a["entity_name"] == "cat.sch.tbl.birthdate"
-                       for a in cfg["tag_assignments"])
+        assert any(a["entity_name"] == "cat.sch.tbl.birthdate"
+                   for a in cfg["tag_assignments"])
         out = capsys.readouterr().out
-        assert "no covering masking function" in out
+        assert "[source: classification]" in out
 
     def test_unmapped_native_class_surfaced_and_llm_suppressed(self, _paths, capsys):
         # 'contact' carries an unmapped class.* tag: no governed tag applied,

@@ -896,34 +896,35 @@ fgac_policies = [
         assert count == 0
         assert_valid_hcl(path)
 
-    def test_removes_excess_policies_when_over_limit(self, tmp_tfvars, monkeypatch):
+    def test_errors_without_removing_excess_policies(self, tmp_tfvars, monkeypatch):
         import generate_abac
         monkeypatch.setattr(generate_abac, "_FGAC_PER_CATALOG_LIMIT", 2)
         path = tmp_tfvars(self._make_hcl(["p1", "p2", "p3", "p4"]))
-        count = autofix_fgac_policy_count(path)
-        assert count == 2
+        original = path.read_text()
+        with pytest.raises(ValueError, match="no policies were dropped") as exc:
+            autofix_fgac_policy_count(path)
+        assert "p1, p2, p3, p4" in str(exc.value)
+        assert path.read_text() == original
         cfg = assert_valid_hcl(path)
-        remaining = cfg.get("fgac_policies", [])
-        assert len(remaining) == 2
+        assert len(cfg.get("fgac_policies", [])) == 4
 
-    def test_remove_block_leaves_valid_hcl(self, tmp_tfvars, monkeypatch):
-        """After _remove_block runs, the file must still parse as valid HCL."""
+    def test_cap_error_leaves_valid_hcl(self, tmp_tfvars, monkeypatch):
         import generate_abac
         monkeypatch.setattr(generate_abac, "_FGAC_PER_CATALOG_LIMIT", 1)
         path = tmp_tfvars(self._make_hcl(["alpha", "beta", "gamma"]))
-        autofix_fgac_policy_count(path)
+        with pytest.raises(ValueError):
+            autofix_fgac_policy_count(path)
         assert_valid_hcl(path)
 
-    def test_remove_block_no_stray_commas(self, tmp_tfvars, monkeypatch):
-        """Ensure no double-commas after block removal and the result is valid HCL."""
+    def test_cap_error_does_not_rewrite_content(self, tmp_tfvars, monkeypatch):
         import generate_abac
         monkeypatch.setattr(generate_abac, "_FGAC_PER_CATALOG_LIMIT", 1)
         path = tmp_tfvars(self._make_hcl(["x", "y"]))
-        autofix_fgac_policy_count(path)
+        original = path.read_text()
+        with pytest.raises(ValueError):
+            autofix_fgac_policy_count(path)
         text = path.read_text()
-        # HCL allows trailing commas before ] — only double commas are invalid
-        assert ",,\n" not in text
-        # The remaining HCL must still parse
+        assert text == original
         assert_valid_hcl(path)
 
     def test_multiple_catalogs_each_respect_limit(self, tmp_tfvars, monkeypatch):
@@ -964,9 +965,10 @@ fgac_policies = [
         hcl += "]\n"
 
         path = tmp_tfvars(hcl)
-        # 3 per catalog, limit 2 → 1 removal per catalog = 2 total
-        count = autofix_fgac_policy_count(path)
-        assert count == 2
+        with pytest.raises(ValueError) as exc:
+            autofix_fgac_policy_count(path)
+        assert "catalog 'cat_a'" in str(exc.value)
+        assert "catalog 'cat_b'" in str(exc.value)
         assert_valid_hcl(path)
 
 

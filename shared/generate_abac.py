@@ -2286,12 +2286,12 @@ _FGAC_PER_CATALOG_LIMIT = 100  # max policies per catalog
 
 
 def autofix_fgac_policy_count(tfvars_path: Path) -> int:
-    """Trim fgac_policies to at most _FGAC_PER_CATALOG_LIMIT per catalog.
+    """Fail when generated policies exceed Unity Catalog's catalog quota.
 
-    When trimming is required, preserve coverage of non-public tag assignments
-    first, then drop lower-priority policies such as amount rounding.
-
-    Returns the number of policies removed.
+    Option-B treatment derivation normally emits only one mask per treatment
+    and catalog, so quota pressure is substantially reduced.  It is never safe
+    to resolve an excess by deleting policies (or the sensitive assignments
+    they protect), however.
     """
     try:
         import hcl2  # type: ignore
@@ -2309,358 +2309,23 @@ def autofix_fgac_policy_count(tfvars_path: Path) -> int:
     if not policies:
         return 0
 
-    def _value_requires_coverage(tag_value: str) -> bool:
-        return tag_value.strip().lower() not in {"public", "general", "exact"}
-
-    def _extract_tag_refs(condition: str) -> tuple[list[tuple[str, str]], list[str]]:
-        value_refs = re.findall(r"hasTagValue\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", condition or "")
-        key_refs = re.findall(r"hasTag\(\s*'([^']+)'\s*\)", condition or "")
-        return value_refs, key_refs
-
-    def _condition_matches_tags(condition: str, tags: dict[str, set[str]]) -> bool:
-        if not condition:
-            return True
-        expr = condition
-
-        def repl_value(match: re.Match) -> str:
-            key, value = match.group(1), match.group(2)
-            return str(value in tags.get(key, set()))
-
-        def repl_key(match: re.Match) -> str:
-            key = match.group(1)
-            return str(key in tags and bool(tags[key]))
-
-        expr = re.sub(r"hasTagValue\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", repl_value, expr)
-        expr = re.sub(r"hasTag\(\s*'([^']+)'\s*\)", repl_key, expr)
-        expr = re.sub(r"\bAND\b", " and ", expr)
-        expr = re.sub(r"\bOR\b", " or ", expr)
-        if re.search(r"[^()\sA-Za-z]", expr):
-            return False
-        try:
-            return bool(eval(expr, {"__builtins__": {}}, {}))
-        except Exception:
-            return False
-
-    def _entity_table_name(entity_type: str, entity_name: str) -> str:
-        if entity_type == "tables":
-            return entity_name
-        if entity_type == "columns":
-            return ".".join(entity_name.split(".")[:3])
-        return ""
-
-    def _assignment_priority(entity_name: str, tag_key: str, tag_value: str, entity_type: str) -> int:
-        if entity_type == "tables":
-            key_blob = f"{tag_key} {tag_value} {entity_name}".lower()
-            if any(tok in key_blob for tok in ("aml", "hipaa", "pci", "compliance", "audit")):
-                return 85
-            return 50
-
-        blob = f"{entity_name} {tag_key} {tag_value}".lower()
-        if any(tok in blob for tok in ("ssn", "mrn", "cvv", "pan", "government", "token", "secret", "account_number", "iban")):
-            return 100
-        if any(tok in blob for tok in ("card_number", "credit_card")):
-            return 95
-        # Country-specific regulated identifiers (ANZ, India, ASEAN)
-        if any(tok in blob for tok in (
-            "tfn", "tax_file", "medicare", "bsb", "ird", "nhi",       # ANZ
-            "aadhaar", "pan_number", "uan", "ifsc",                    # India
-            "nric", "fin_number", "mykad", "nik",                      # ASEAN
-            "aml_risk", "compliance", "audit",                         # Compliance flags
-        )):
-            return 90
-        if any(tok in blob for tok in ("address", "birth", "dob", "date_of_birth")):
-            return 80
-        if any(tok in blob for tok in ("email", "phone", "name")):
-            return 70
-        if any(tok in blob for tok in ("amount", "balance", "limit", "rounded")):
-            return 20
-        return 40
-
-    assignments = cfg.get("tag_assignments", []) or []
-    entity_tags: dict[tuple[str, str], dict[str, set[str]]] = {}
-    assignment_meta: dict[str, dict] = {}
-    for ta in assignments:
-        etype = ta.get("entity_type", "")
-        ename = ta.get("entity_name", "")
-        tkey = ta.get("tag_key", "")
-        tval = ta.get("tag_value", "")
-        if not (etype and ename and tkey and tval):
-            continue
-        per_entity = entity_tags.setdefault((etype, ename), {})
-        per_entity.setdefault(tkey, set()).add(tval)
-        if not _value_requires_coverage(tval):
-            continue
-        assignment_id = f"{etype}|{ename}|{tkey}|{tval}"
-        assignment_meta[assignment_id] = {
-            "entity_type": etype,
-            "entity_name": ename,
-            "tag_key": tkey,
-            "tag_value": tval,
-            "catalog": ename.split(".")[0],
-            "priority": _assignment_priority(ename, tkey, tval, etype),
-        }
-
-    def _policy_matches_assignment(policy: dict, assignment: dict) -> bool:
-        policy_catalog = policy.get("catalog", "") or policy.get("function_catalog", "")
-        entity_name = assignment["entity_name"]
-        entity_type = assignment["entity_type"]
-        if policy_catalog and policy_catalog != assignment["catalog"]:
-            return False
-
-        table_name = _entity_table_name(entity_type, entity_name)
-        table_tags = entity_tags.get(("tables", table_name), {})
-        if entity_type == "columns":
-            if policy.get("policy_type") != "POLICY_TYPE_COLUMN_MASK":
-                return False
-            column_tags = entity_tags.get(("columns", entity_name), {})
-            if not _condition_matches_tags(policy.get("match_condition", ""), column_tags):
-                return False
-            return _condition_matches_tags(policy.get("when_condition", ""), table_tags)
-
-        if entity_type == "tables":
-            when_condition = policy.get("when_condition", "")
-            if not when_condition:
-                return False
-            return _condition_matches_tags(when_condition, table_tags)
-
-        return False
-
     per_catalog_policies: dict[str, list[tuple[int, dict]]] = {}
     for idx, p in enumerate(policies):
         cat = p.get("catalog", "") or p.get("function_catalog", "")
         if cat:
             per_catalog_policies.setdefault(cat, []).append((idx, p))
 
-    to_drop: set[str] = set()
-    assignments_to_remove: list[tuple[str, str, str]] = []  # (tag_key, tag_value, entity_name)
+    excess: list[str] = []
     for cat, indexed_policies in per_catalog_policies.items():
-        if len(indexed_policies) <= _FGAC_PER_CATALOG_LIMIT:
-            continue
-
-        protected_assignments = {
-            aid: meta for aid, meta in assignment_meta.items() if meta["catalog"] == cat
-        }
-        selected_names: list[str] = []
-        covered_ids: set[str] = set()
-        remaining = list(indexed_policies)
-
-        while remaining and len(selected_names) < _FGAC_PER_CATALOG_LIMIT:
-            best_tuple = None
-            best_idx = None
-            for list_idx, (original_idx, policy) in enumerate(remaining):
-                policy_name = policy.get("name", "")
-                policy_type = policy.get("policy_type", "")
-                coverage = {
-                    aid for aid, meta in protected_assignments.items() if _policy_matches_assignment(policy, meta)
-                }
-                new_coverage = coverage - covered_ids
-                coverage_score = sum(protected_assignments[aid]["priority"] for aid in new_coverage)
-                base_priority = max(
-                    (protected_assignments[aid]["priority"] for aid in coverage),
-                    default=(60 if policy_type == "POLICY_TYPE_ROW_FILTER" else 10),
-                )
-                score = (coverage_score, len(new_coverage), base_priority, -original_idx)
-                if best_tuple is None or score > best_tuple:
-                    best_tuple = score
-                    best_idx = list_idx
-
-            if best_idx is None:
-                break
-            original_idx, chosen = remaining.pop(best_idx)
-            chosen_name = chosen.get("name", "")
-            if not chosen_name:
-                continue
-            selected_names.append(chosen_name)
-            covered_ids.update(
-                aid for aid, meta in protected_assignments.items() if _policy_matches_assignment(chosen, meta)
+        if len(indexed_policies) > _FGAC_PER_CATALOG_LIMIT:
+            names = [p.get("name", "<unnamed>") for _, p in indexed_policies]
+            excess.append(
+                f"catalog '{cat}' has {len(indexed_policies)} policies "
+                f"(limit {_FGAC_PER_CATALOG_LIMIT}): {', '.join(names)}"
             )
-
-        if len(selected_names) < _FGAC_PER_CATALOG_LIMIT:
-            extras = [
-                p.get("name", "")
-                for _idx, p in indexed_policies
-                if p.get("name", "") and p.get("name", "") not in selected_names
-            ]
-            selected_names.extend(extras[: _FGAC_PER_CATALOG_LIMIT - len(selected_names)])
-
-        kept = set(selected_names)
-        dropped = [p.get("name", "") for _idx, p in indexed_policies if p.get("name", "") not in kept]
-        if dropped:
-            to_drop.update(dropped)
-            print(
-                f"  [AUTOFIX] Catalog '{cat}': {len(indexed_policies)} fgac_policies exceeds "
-                f"limit of {_FGAC_PER_CATALOG_LIMIT}. Dropping {len(dropped)}: "
-                + ", ".join(dropped)
-            )
-            uncovered_assignments = [
-                meta
-                for aid, meta in protected_assignments.items()
-                if aid not in covered_ids
-            ]
-            if uncovered_assignments:
-                uncovered_desc = [
-                    f"{meta['entity_name']} ({meta['tag_key']} = '{meta['tag_value']}')"
-                    for meta in uncovered_assignments
-                ]
-                print(
-                    "  [AUTOFIX] Policy cap leaves uncovered sensitive assignments, removing them: "
-                    + ", ".join(uncovered_desc)
-                )
-                assignments_to_remove.extend(
-                    (meta["tag_key"], meta["tag_value"], meta["entity_name"])
-                    for meta in uncovered_assignments
-                )
-
-    if not to_drop and not assignments_to_remove:
-        return 0
-
-    # Remove each excess policy block from the HCL text using brace counting
-    # so that nested blocks (column_mask = { ... }, match_columns = [...]) are
-    # handled correctly.  A plain regex can't handle nested braces.
-    def _remove_block(txt: str, block_name: str) -> tuple[str, bool]:
-        """Find the policy block with `name = "block_name"` and remove it."""
-        name_pat = re.compile(r'name\s*=\s*"' + re.escape(block_name) + r'"')
-        m = name_pat.search(txt)
-        if not m:
-            return txt, False
-
-        pos = m.start()
-
-        # Walk backward from `name =` to find the opening { of the block.
-        depth = 0
-        block_start = None
-        i = pos - 1
-        while i >= 0:
-            c = txt[i]
-            if c == '}':
-                depth += 1
-            elif c == '{':
-                if depth == 0:
-                    block_start = i
-                    break
-                depth -= 1
-            i -= 1
-
-        if block_start is None:
-            return txt, False
-
-        # Walk forward from block_start to find the matching }.
-        depth = 0
-        block_end = None
-        i = block_start
-        while i < len(txt):
-            c = txt[i]
-            if c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-                if depth == 0:
-                    block_end = i
-                    break
-            i += 1
-
-        if block_end is None:
-            return txt, False
-
-        # Determine slice boundaries that include surrounding whitespace and
-        # the trailing comma (same algorithm as autofix_invalid_tag_values so
-        # that the removal always leaves well-formed HCL).
-        end = block_end + 1
-        while end < len(txt) and txt[end] in (",", " ", "\t"):
-            end += 1
-        start = block_start
-        while start > 0 and txt[start - 1] in (" ", "\t"):
-            start -= 1
-        if start > 0 and txt[start - 1] == "\n":
-            start -= 1
-
-        return txt[:start] + txt[end:], True
-
-    removed = 0
-    for name in to_drop:
-        text, did_remove = _remove_block(text, name)
-        if did_remove:
-            removed += 1
-
-    # Remove tag_assignments left uncovered by dropped policies
-    assignments_removed = 0
-    for tag_key, tag_value, entity_name in assignments_to_remove:
-        # Match blocks containing all three: entity_name, tag_key, tag_value
-        pattern = re.compile(
-            r'entity_name\s*=\s*"' + re.escape(entity_name) + r'"'
-            r'.*?'
-            r'tag_key\s*=\s*"' + re.escape(tag_key) + r'"'
-            r'.*?'
-            r'tag_value\s*=\s*"' + re.escape(tag_value) + r'"',
-            re.DOTALL,
-        )
-        # Also check alternate field orderings
-        pattern_rev = re.compile(
-            r'tag_key\s*=\s*"' + re.escape(tag_key) + r'"'
-            r'.*?'
-            r'tag_value\s*=\s*"' + re.escape(tag_value) + r'"'
-            r'.*?'
-            r'entity_name\s*=\s*"' + re.escape(entity_name) + r'"',
-            re.DOTALL,
-        )
-        m = pattern.search(text) or pattern_rev.search(text)
-        if not m:
-            continue
-        pos = m.start()
-        # Walk backward to find the opening {
-        depth = 0
-        block_start = None
-        i = pos - 1
-        while i >= 0:
-            c = text[i]
-            if c == '}':
-                depth += 1
-            elif c == '{':
-                if depth == 0:
-                    block_start = i
-                    break
-                depth -= 1
-            i -= 1
-        if block_start is None:
-            continue
-        # Walk forward to find the matching }
-        depth = 0
-        block_end = None
-        i = block_start
-        while i < len(text):
-            c = text[i]
-            if c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-                if depth == 0:
-                    block_end = i
-                    break
-            i += 1
-        if block_end is None:
-            continue
-        end = block_end + 1
-        while end < len(text) and text[end] in (",", " ", "\t"):
-            end += 1
-        start = block_start
-        while start > 0 and text[start - 1] in (" ", "\t"):
-            start -= 1
-        if start > 0 and text[start - 1] == "\n":
-            start -= 1
-        text = text[:start] + text[end:]
-        assignments_removed += 1
-        print(
-            f"  [AUTOFIX] Removed uncovered tag_assignment: "
-            f"{entity_name} ({tag_key} = '{tag_value}')"
-        )
-
-    if removed or assignments_removed:
-        # Clean up stray commas and double-blank lines left by removal
-        text = _cleanup_stray_commas(text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        tfvars_path.write_text(text)
-
-    return removed
+    if excess:
+        raise ValueError("FGAC policy quota exceeded; no policies were dropped. " + " | ".join(excess))
+    return 0
 
 
 def _find_bracket_section(text: str, section_name: str) -> tuple[int, int] | None:
@@ -2816,6 +2481,9 @@ def derive_enforcement_treatments(tfvars_path: Path) -> int:
             f"Cannot derive enforcement treatments from {tfvars_path}: {exc}"
         ) from exc
 
+    provenance = re.findall(
+        r"^\s*#\s*gr\.classification_unmapped:[^\n]+$", text, re.MULTILINE
+    )
     derived, changes = derive_treatment_model(cfg, load_treatment_config())
     if not changes:
         return 0
@@ -2831,6 +2499,8 @@ def derive_enforcement_treatments(tfvars_path: Path) -> int:
         text, "fgac_policies",
         [_render_fgac_policy_block(item) for item in derived.get("fgac_policies", [])],
     )
+    if provenance:
+        text = "\n".join(provenance) + "\n" + text
     tfvars_path.write_text(text)
     return changes
 
@@ -3317,7 +2987,7 @@ def autofix_missing_fgac_policies(tfvars_path: Path, sql_path: Path | None = Non
         # picking arbitrary alphabetical first (which caused mask_abn to be
         # chosen for every uncategorized string column when ANZ overlay is loaded).
         # Skip last-resort for numeric/date columns — a wrong-type function is
-        # worse than no policy (the tag assignment will be removed as uncovered).
+        # worse than no policy (the blocking coverage gate will surface the gap).
         if available_functions and not is_numeric_or_date:
             # Extract semantic tokens from the tag value (strip common prefixes)
             tv_norm = tval.replace("masked_", "").replace("redacted_", "")
@@ -3335,7 +3005,7 @@ def autofix_missing_fgac_policies(tfvars_path: Path, sql_path: Path | None = Non
                         return ranked[0]
                     # No semantic match — don't pick random filter (would cause
                     # category mismatch at query time). Return None so the tag
-                    # stays uncovered and gets removed by autofix_remove_uncovered_tags.
+                    # stays uncovered and is rejected by the coverage gate.
             else:
                 mask_fns = [f for f in available_functions if f.startswith("mask_") and _arg_count_ok(f)]
                 if mask_fns:
@@ -5291,35 +4961,25 @@ def autofix_untagged_pii_columns(
     llm_source = LLMSource(_ddl_pattern_infer)
     findings = select_findings(candidate_columns, classification_source, llm_source)
 
-    # Route EVERY finding (classification and LLM alike) through the same
-    # covering-function check, so no source can introduce a tag_value that has
-    # no masking function to cover it.  LLM findings are already pre-filtered via
-    # active_patterns, so in practice this only ever drops an uncovered
-    # classification value.
-    covered_findings: list[Finding] = []
-    for f in findings:
-        if _any_covering_fn_available(f.tag_value):
-            covered_findings.append(f)
-        else:
-            print(
-                f"  [SENSITIVITY] Skipped {f.source} tag for {f.entity_name} "
-                f"({f.tag_key} = '{f.tag_value}'): no covering masking function available"
-            )
-    findings = covered_findings
+    # Never discard an authoritative classification finding because protection
+    # is incomplete. Preserve it in generated config so the blocking coverage
+    # gate can reject the gap and show the operator exactly what must be fixed.
 
     # Surface natively-classified columns we could not tag (unmapped class.*
     # semantic), so a reviewer / coverage gate sees that authority was claimed
     # but no governed tag applied.  These columns are still NOT handed to the LLM
     # (select_findings claimed them), preventing a silent LLM override.
+    unmapped_findings: list[tuple[str, str]] = []
     if classification_source is not None and hasattr(classification_source, "unmapped_columns"):
-        for entity_name, semantic in classification_source.unmapped_columns(candidate_columns):
+        unmapped_findings = classification_source.unmapped_columns(candidate_columns)
+        for entity_name, semantic in unmapped_findings:
             print(
                 f"  [SENSITIVITY] Column {entity_name} carries native "
                 f"class.{semantic} with no governed mapping — left untagged "
                 "(LLM override suppressed)"
             )
 
-    if not findings:
+    if not findings and not unmapped_findings:
         return 0
 
     new_assignments: list[dict] = [f.as_assignment() for f in findings]
@@ -5353,13 +5013,23 @@ def autofix_untagged_pii_columns(
             f"({f.tag_key} = '{f.tag_value}') [source: {f.source}]"
         )
 
-    injection = "\n" + "\n".join(lines) + "\n"
+    markers = [
+        f"# gr.classification_unmapped: {entity_name}|class.{semantic}"
+        for entity_name, semantic in unmapped_findings
+    ]
+    injection = "\n" + "\n".join(markers + lines) + "\n"
     text = text[:insert_pos] + injection + text[insert_pos:]
     tfvars_path.write_text(text)
     return len(findings)
 
 
 def autofix_remove_uncovered_tags(tfvars_path: Path, sql_path: Path | None = None) -> int:
+    """Deprecated safety shim: uncovered sensitive tags are never removed.
+
+    Coverage gaps are intentionally preserved for the blocking coverage gate.
+    """
+    return 0
+
     """Last-resort: remove tag_assignments that no active FGAC policy covers.
 
     After all other autofixes have had a chance, any non-public tag_assignment
@@ -7019,10 +6689,6 @@ Before you apply, tune for your business roles, security requirements, and Genie
         if n_repaired:
             print(f"  Auto-fixed: added {n_repaired} fgac_policy/ies for uncovered sensitive tags")
 
-        n_dropped = autofix_fgac_policy_count(tfvars_path)
-        if n_dropped:
-            print(f"  Auto-fixed: dropped {n_dropped} fgac_policy/ies exceeding per-catalog limit ({_FGAC_PER_CATALOG_LIMIT})")
-
         # Second pass: autofix_missing_fgac_policies (above) may have injected
         # new hasTagValue() conditions referencing values that weren't in the
         # original tag_policies.  Re-run autofix_tag_policies to pick them up.
@@ -7050,6 +6716,10 @@ Before you apply, tune for your business roles, security requirements, and Genie
             n_treatments = derive_enforcement_treatments(tfvars_path)
             if n_treatments:
                 print(f"  Derived GenieRails enforcement treatments ({n_treatments} change(s))")
+
+        # Check the hard UC quota after Option-B has collapsed masks to one
+        # policy per treatment/catalog. Never delete policies to fit the cap.
+        autofix_fgac_policy_count(tfvars_path)
 
         n_fn_canonical = autofix_canonical_function_names(tfvars_path, sql_path if sql_block else None)
         if n_fn_canonical:
@@ -7188,12 +6858,8 @@ Before you apply, tune for your business roles, security requirements, and Genie
         if n_final_canonical:
             print(f"  Auto-fixed (final pass): normalized {n_final_canonical} tag vocabulary reference(s)")
 
-        # Last-resort: drop tag_assignments that no active FGAC policy covers.
-        # Prevents "is not covered by any active fgac_policy" validation failures.
-        # Pass SQL path so policies referencing missing functions are treated as inactive.
-        n_uncovered = autofix_remove_uncovered_tags(tfvars_path, sql_path if sql_block else None)
-        if n_uncovered:
-            print(f"  Auto-fixed (final pass): removed {n_uncovered} uncovered tag_assignment(s)")
+        # Uncovered sensitive assignments remain intact: validation/coverage
+        # must block rather than silently shrinking the protected surface.
 
         # ── Final governance mode safety strip ─────────────────────────────────
         # Multiple code paths (autofixes, semantic retries) can re-introduce
@@ -7268,7 +6934,6 @@ Before you apply, tune for your business roles, security requirements, and Genie
                         )
                         autofix_tag_policies(tfvars_path)  # register new PII tag values
                     autofix_missing_fgac_policies(tfvars_path, sql_path if sql_block else None)
-                    autofix_fgac_policy_count(tfvars_path)
                     if args.mode != "governance":
                         autofix_genie_config_fields(tfvars_path)
                         # CRITICAL: Ensure every configured genie_space has a
@@ -7279,6 +6944,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                         autofix_acl_groups(tfvars_path, env_tfvars if env_tfvars.exists() else None)
                     if args.mode != "genie":
                         derive_enforcement_treatments(tfvars_path)
+                    autofix_fgac_policy_count(tfvars_path)
                     autofix_canonical_function_names(tfvars_path, sql_path if sql_block else None)
                     autofix_invalid_function_refs(tfvars_path, sql_path if sql_block else None)
                     autofix_fgac_arg_count_mismatch(tfvars_path, sql_path if sql_block else None)
@@ -7292,8 +6958,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                     autofix_malformed_conditions(tfvars_path)
                     # Deploy overlay-injected fns cross-catalog (multi-catalog support)
                     autofix_cross_catalog_function_deployment(tfvars_path, sql_path if sql_block else None)
-                    # Last-resort: drop uncovered tag_assignments
-                    autofix_remove_uncovered_tags(tfvars_path, sql_path if sql_block else None)
+                    # Preserve uncovered assignments for the blocking gate.
                     # Final governance strip after retry autofixes
                     if args.mode == "governance":
                         _retry_text = tfvars_path.read_text()
@@ -7365,9 +7030,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                 )
                 if n_repaired_assembled:
                     print(f"  Auto-fixed assembled abac: added {n_repaired_assembled} fgac_policy/ies for uncovered sensitive tags")
-                n_dropped_assembled = autofix_fgac_policy_count(assembled_abac_path)
-                if n_dropped_assembled:
-                    print(f"  Auto-fixed assembled abac: dropped {n_dropped_assembled} fgac_policy/ies exceeding per-catalog limit ({_FGAC_PER_CATALOG_LIMIT})")
+                autofix_fgac_policy_count(assembled_abac_path)
                 n_fields_assembled = autofix_genie_config_fields(assembled_abac_path)
                 if n_fields_assembled:
                     print(f"  Auto-fixed assembled abac: added {n_fields_assembled} missing required field(s) in genie_space_configs")

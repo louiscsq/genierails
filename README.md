@@ -45,6 +45,20 @@ https://github.com/user-attachments/assets/b58d83e7-d95c-416d-9df3-03292d9db617
 | Starting from scratch (no Genie Space yet) | [Quickstart](shared/docs/quickstart.md) | ~30 min |
 | Need the full reference | [Playbook](shared/docs/playbook.md) | Reference |
 
+## Blocking sensitive-column coverage gate
+
+After generation, run `make coverage-gate ENV=<environment>` from `aws/` or
+`azure/`. The offline gate reads `generated/abac.auto.tfvars` and
+`generated/masking_functions.sql` and exits non-zero if a classification finding
+has no treatment mapping, a classified column has no covering column-mask
+policy, or a treatment's masking function is absent. Native classification is
+read live only during generation through the existing classification source.
+
+GenieRails never deletes sensitive tags or mask policies to make output deploy.
+The Unity Catalog 100-policy-per-catalog quota is a hard error listing the
+affected policies. Option-B treatment derivation substantially reduces pressure
+on this quota by emitting one policy per treatment and catalog.
+
 ## Repository Layout
 
 ```

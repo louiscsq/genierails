@@ -19,6 +19,7 @@ import argparse
 from pathlib import Path
 
 from tag_vocabulary import REGISTRY
+from treatment_derivation import load_treatment_config
 
 try:
     import hcl2
@@ -203,6 +204,92 @@ def _entity_table_name(entity_type: str, entity_name: str) -> str:
 
 def _value_requires_coverage(tag_value: str) -> bool:
     return tag_value.strip().lower() not in {"public", "general", "exact"}
+
+
+def validate_coverage_gate(
+    cfg: dict,
+    sql_functions: set[str] | None,
+    raw_tfvars: str,
+    result: ValidationResult,
+) -> None:
+    """Block every classification/treatment coverage gap in generated config."""
+    treatment_cfg = load_treatment_config()
+    mapped_sources = {source for item in treatment_cfg.treatments for source in item.sources}
+    treatment_functions = {item.value: item.masking_function for item in treatment_cfg.treatments}
+    assignments = cfg.get("tag_assignments", []) or []
+    policies = cfg.get("fgac_policies", []) or []
+
+    source_columns: dict[str, list[tuple[str, str]]] = {}
+    treatments: dict[str, str] = {}
+    for item in assignments:
+        if item.get("entity_type") != "columns":
+            continue
+        column = item.get("entity_name", "")
+        source = (item.get("tag_key", ""), item.get("tag_value", ""))
+        if source in mapped_sources:
+            source_columns.setdefault(column, []).append(source)
+        if item.get("tag_key") == treatment_cfg.tag_key:
+            treatments[column] = item.get("tag_value", "")
+
+    unmapped = [
+        (column.strip(), detected.strip())
+        for column, detected in re.findall(
+            r"^\s*#\s*gr\.classification_unmapped:\s*([^|\n]+)\|([^\n]+)$",
+            raw_tfvars,
+            re.MULTILINE,
+        )
+    ]
+    unprotected: list[str] = []
+    missing_policies: set[str] = set()
+    missing_functions: set[str] = set()
+    policy_quota: list[str] = []
+
+    by_catalog: dict[str, list[str]] = {}
+    for policy in policies:
+        catalog = policy.get("catalog", "") or policy.get("function_catalog", "")
+        if catalog:
+            by_catalog.setdefault(catalog, []).append(policy.get("name", "<unnamed>"))
+    for catalog, names in sorted(by_catalog.items()):
+        if len(names) > 100:
+            policy_quota.append(
+                f"catalog {catalog}: {len(names)} policies (limit 100): {', '.join(names)}"
+            )
+
+    for column, sources in sorted(source_columns.items()):
+        treatment = treatments.get(column)
+        if not treatment:
+            unprotected.append(f"{column} (detected: {', '.join(f'{k}={v}' for k, v in sources)}; no gr.treatment)")
+            continue
+        catalog = column.split(".", 1)[0]
+        matching = [
+            p for p in policies
+            if p.get("policy_type") == "POLICY_TYPE_COLUMN_MASK"
+            and p.get("catalog") == catalog
+            and (treatment_cfg.tag_key, treatment) in _extract_tag_refs(p.get("match_condition", ""))[0]
+        ]
+        if not matching:
+            missing_policies.add(f"{treatment} (catalog {catalog}; used by {column})")
+            unprotected.append(f"{column} (treatment {treatment}; no covering column-mask policy)")
+            continue
+        expected_fn = treatment_functions.get(treatment)
+        if not expected_fn:
+            missing_policies.add(f"{treatment} (no treatment mapping/rule)")
+        elif sql_functions is None or expected_fn not in sql_functions:
+            missing_functions.add(f"{expected_fn} (treatment {treatment}; used by {column})")
+            unprotected.append(f"{column} (treatment {treatment}; masking function {expected_fn} missing)")
+
+    groups = [
+        ("detected tags with no mapping/rule", [f"{c} ({d})" for c, d in unmapped]),
+        ("classified but unprotected columns", unprotected),
+        ("treatments missing a column-mask policy", sorted(missing_policies)),
+        ("treatments missing a masking function", sorted(missing_functions)),
+        ("Unity Catalog policy quota exceeded", policy_quota),
+    ]
+    for title, items in groups:
+        if items:
+            result.error(f"COVERAGE GATE — {title}:\n    - " + "\n    - ".join(items))
+    if not any(items for _, items in groups):
+        result.ok(f"Coverage gate: {len(source_columns)} classified column(s) fully protected")
 
 
 def _load_country_categories(
@@ -893,6 +980,11 @@ def main():
     parser.add_argument("tfvars", help="Path to abac.auto.tfvars file")
     parser.add_argument("sql", nargs="?", help="Path to masking_functions.sql (optional)")
     parser.add_argument(
+        "--coverage-gate",
+        action="store_true",
+        help="Block if any classification-derived treatment lacks a mask policy/function",
+    )
+    parser.add_argument(
         "--country",
         metavar="CODE",
         help="Comma-separated region codes for country-specific column inference "
@@ -983,6 +1075,10 @@ def main():
                            sql_function_arg_counts=sql_function_arg_counts)
     validate_group_members(merged_cfg, group_names, result)
     validate_acl_groups(merged_cfg, group_names, result)
+    if args.coverage_gate:
+        if sql_path is None:
+            result.error("COVERAGE GATE — masking_functions.sql is required")
+        validate_coverage_gate(merged_cfg, sql_functions, tfvars_path.read_text(), result)
 
     result.print_report()
     sys.exit(0 if result.passed else 1)

@@ -1,10 +1,10 @@
 {
-  "tag_key": "gr.treatment",
+  "tag_key": "gr_treatment",
   "description": "GenieRails-owned enforcement treatment derived from sensitivity findings. Entries are ordered strictest-first.",
   "treatments": [
     {"value": "redact", "masking_function": "mask_redact", "sources": [
       ["pci_level", "redacted_cvv"], ["pci_level", "redacted_card_full"],
-      ["pii_level", "redacted_address"], ["phi_level", "redacted"],
+      ["pii_level", "redacted_address"], ["pii_level", "redacted_mixed"], ["phi_level", "redacted"],
       ["phi_level", "Restricted_PHI"], ["phi_level", "redacted_notes"]
     ]},
     {"value": "ssn_last4", "masking_function": "mask_ssn", "sources": [["pii_level", "masked_ssn"]]},

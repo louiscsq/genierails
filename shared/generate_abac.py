@@ -2665,7 +2665,7 @@ def _render_fgac_policy_block(policy: dict) -> str:
 
 
 def derive_enforcement_treatments(tfvars_path: Path) -> int:
-    """Materialize one ``gr.treatment`` value and mask per sensitive column."""
+    """Materialize one ``gr_treatment`` value and mask per sensitive column."""
     try:
         import hcl2
         text = tfvars_path.read_text()
@@ -5184,7 +5184,45 @@ def autofix_untagged_pii_columns(
     if not findings and not unmapped_findings:
         return 0
 
-    new_assignments: list[dict] = [f.as_assignment() for f in findings]
+    # Native classification can report multiple semantics for one column (for
+    # example email + phone + name in free text). Several semantics can map to
+    # the same governed tag key, but UC permits only one value per key/entity.
+    # Collapse same-key collisions using Option-B's configured precedence.
+    # Findings from different tag families remain intact so the later treatment
+    # derivation can still resolve cross-family precedence (for example PII + PCI).
+    treatment_cfg = load_treatment_config()
+    treatment_rank = {
+        source: rank
+        for rank, treatment in enumerate(treatment_cfg.treatments)
+        for source in treatment.sources
+    }
+    findings_by_key: dict[tuple[str, str], list[Finding]] = {}
+    for finding in findings:
+        key = (finding.entity_name, finding.tag_key)
+        findings_by_key.setdefault(key, []).append(finding)
+    collapsed: dict[tuple[str, str], Finding] = {}
+    for key, candidates in findings_by_key.items():
+        current = min(
+            candidates,
+            key=lambda finding: treatment_rank.get(
+                (finding.tag_key, finding.tag_value), len(treatment_rank)
+            ),
+        )
+        # Domain-specific partial masks are unsafe for narrative text that the
+        # native classifier says contains several different PII semantics. Use
+        # a canonical full-redaction value instead of applying (for example)
+        # an email parser to a sentence containing an embedded email and phone.
+        if key[1] == "pii_level" and len({f.tag_value for f in candidates}) > 1:
+            current = Finding(
+                entity_name=current.entity_name,
+                tag_key="pii_level",
+                tag_value="redacted_mixed",
+                source=current.source,
+                detail="multi-semantic native PII",
+            )
+        collapsed[key] = current
+    collapsed_findings = list(collapsed.values())
+    new_assignments: list[dict] = [f.as_assignment() for f in collapsed_findings]
 
     # Inject new tag assignments into the HCL text
     # Find the tag_assignments section and append before the closing ]
@@ -5205,7 +5243,7 @@ def autofix_untagged_pii_columns(
         insert_pos = ta_section.end(2)
 
     lines = []
-    for f in findings:
+    for f in collapsed_findings:
         lines.append(
             f'  {{ entity_type = "columns", entity_name = "{f.entity_name}", '
             f'tag_key = "{f.tag_key}", tag_value = "{f.tag_value}" }},'
@@ -5222,7 +5260,7 @@ def autofix_untagged_pii_columns(
     injection = "\n" + "\n".join(markers + lines) + "\n"
     text = text[:insert_pos] + injection + text[insert_pos:]
     tfvars_path.write_text(text)
-    return len(findings)
+    return len(collapsed_findings)
 
 
 def autofix_remove_uncovered_tags(tfvars_path: Path, sql_path: Path | None = None) -> int:

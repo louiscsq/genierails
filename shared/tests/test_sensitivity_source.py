@@ -57,6 +57,19 @@ class TestClassificationSourceColumnTags:
         assert len(findings) == 1
         assert (findings[0].tag_key, findings[0].tag_value) == ("pii_level", "masked_phone")
 
+    def test_maps_documented_name_and_card_security_code_tags(self):
+        rows = [
+            ("cat", "sch", "tbl", "name", "class.name", ""),
+            ("cat", "sch", "tbl", "cvv", "class.card_security_code", ""),
+        ]
+        findings = ClassificationSource(tag_rows=rows).findings_for([
+            "cat.sch.tbl.name", "cat.sch.tbl.cvv",
+        ])
+        assert [(f.tag_key, f.tag_value) for f in findings] == [
+            ("pii_level", "masked_name"),
+            ("pci_level", "redacted_cvv"),
+        ]
+
     def test_filters_to_requested_columns(self):
         rows = [
             ("cat", "sch", "tbl", "email", "class.email", ""),
@@ -307,6 +320,27 @@ class TestAutofixIntegration:
         # classification's pci value wins; the LLM's masked_email is NOT used
         assert email_tags[0]["tag_key"] == "pci_level"
         assert email_tags[0]["tag_value"] == "masked_card_last4"
+
+    def test_multi_semantic_same_key_collapses_by_treatment_precedence(self, _paths):
+        import generate_abac
+        tfvars, ddl = _paths
+        classification = ClassificationSource(tag_rows=[
+            ("cat", "sch", "tbl", "contact", "class.name", ""),
+            ("cat", "sch", "tbl", "contact", "class.phone_number", ""),
+            ("cat", "sch", "tbl", "contact", "class.email_address", ""),
+        ])
+        added = generate_abac.autofix_untagged_pii_columns(
+            tfvars, ddl_path=ddl, classification_source=classification,
+        )
+        # contact contributes one legal pii_level value, not three conflicting
+        # values. Mixed narrative PII is stricter than every partial mask.
+        assert added == 2  # contact (classification) + email (LLM fallback)
+        cfg = assert_valid_hcl(tfvars)
+        contact_tags = [a for a in cfg["tag_assignments"]
+                        if a["entity_name"] == "cat.sch.tbl.contact"]
+        assert [(a["tag_key"], a["tag_value"]) for a in contact_tags] == [
+            ("pii_level", "redacted_mixed")
+        ]
 
     def test_classification_adds_column_llm_would_miss(self, _paths):
         import generate_abac

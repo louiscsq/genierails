@@ -46,7 +46,7 @@ def test_precedence_multi_tag_column_resolves_to_single_strictest_treatment():
     ]
     assert contact[-1:] == [{
         "entity_type": "columns", "entity_name": "cat.sch.people.contact",
-        "tag_key": "gr.treatment", "tag_value": "redact",
+        "tag_key": "gr_treatment", "tag_value": "redact",
     }]
     assert {(item["tag_key"], item["tag_value"]) for item in contact[:-1]} == {
         ("pii_level", "masked_email"),
@@ -59,7 +59,7 @@ def test_single_tag_ssn_resolves_to_treatment():
     treatments = [
         item for item in derived["tag_assignments"]
         if item["entity_name"] == "cat.sch.people.ssn"
-        and item["tag_key"] == "gr.treatment"
+        and item["tag_key"] == "gr_treatment"
     ]
     assert [item["tag_value"] for item in treatments] == ["ssn_last4"]
 
@@ -79,7 +79,7 @@ def test_column_without_sensitivity_tag_gets_no_treatment():
     derived, _ = derive_treatment_model(cfg, load_treatment_config())
     assert not any(
         item["entity_name"] == "cat.sch.people.public_id"
-        and item["tag_key"] == "gr.treatment"
+        and item["tag_key"] == "gr_treatment"
         for item in derived["tag_assignments"]
     )
 
@@ -97,7 +97,7 @@ def test_derivation_is_idempotent_and_preserves_masks_and_source_tags():
     assert masks
     treatment_counts = {}
     for item in twice["tag_assignments"]:
-        if item["entity_type"] == "columns" and item["tag_key"] == "gr.treatment":
+        if item["entity_type"] == "columns" and item["tag_key"] == "gr_treatment":
             treatment_counts[item["entity_name"]] = treatment_counts.get(item["entity_name"], 0) + 1
     assert treatment_counts
     assert set(treatment_counts.values()) == {1}
@@ -111,7 +111,7 @@ def test_rekeyed_masks_match_no_column_more_than_once():
     assert matches
     assert all(len(policy_names) == 1 for policy_names in matches.values())
     masks = [p for p in derived["fgac_policies"] if p["policy_type"] == "POLICY_TYPE_COLUMN_MASK"]
-    assert all("hasTagValue('gr.treatment'," in p["match_condition"] for p in masks)
+    assert all("hasTagValue('gr_treatment'," in p["match_condition"] for p in masks)
 
 
 def test_multi_catalog_masks_are_scoped_to_one_match_per_column():

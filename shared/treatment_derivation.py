@@ -51,7 +51,7 @@ def resolve_treatment(findings: list[tuple[str, str]], config: TreatmentConfig) 
 
 
 def derive_treatment_model(cfg: dict, config: TreatmentConfig) -> tuple[dict, int]:
-    """Collapse mapped column findings and rebuild masks on ``gr.treatment``.
+    """Collapse mapped column findings and rebuild masks on ``gr_treatment``.
 
     Non-column assignments and unmapped governance tags are preserved. All
     generated column masks are replaced, making the single treatment tag the

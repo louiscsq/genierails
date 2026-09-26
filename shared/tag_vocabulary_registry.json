@@ -1,7 +1,7 @@
 {
   "families": {
     "gr_treatment": {
-      "canonical_key": "gr.treatment",
+      "canonical_key": "gr_treatment",
       "description": "GenieRails-owned, derived enforcement treatment.",
       "canonical_values": ["redact", "ssn_last4", "card_last4", "account_last4", "email_partial", "phone_partial", "name_partial", "date_year", "tfn_partial", "medicare_partial", "bsb_partial", "aadhaar_partial", "generic_partial", "round_amount"],
       "key_aliases": [],
@@ -34,6 +34,7 @@
         "masked_philsys",
         "masked_cccd",
         "masked_fin",
+        "redacted_mixed",
         "redacted_address"
       ],
       "key_aliases": [],

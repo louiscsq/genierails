@@ -320,7 +320,7 @@ def validate_coverage_gate(
     for column, sources in sorted(source_columns.items()):
         treatment = treatments.get(column)
         if not treatment:
-            unprotected.append(f"{column} (detected: {', '.join(f'{k}={v}' for k, v in sources)}; no gr.treatment)")
+            unprotected.append(f"{column} (detected: {', '.join(f'{k}={v}' for k, v in sources)}; no gr_treatment)")
             continue
         catalog = column.split(".", 1)[0]
         matching = [

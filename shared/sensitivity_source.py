@@ -119,6 +119,7 @@ _CLASS_TO_GOVERNED: dict[str, tuple[str, str]] = {
     "phone": ("pii_level", "masked_phone"),
     "phone_number": ("pii_level", "masked_phone"),
     "telephone": ("pii_level", "masked_phone"),
+    "name": ("pii_level", "masked_name"),
     "address": ("pii_level", "redacted_address"),
     "postal_address": ("pii_level", "redacted_address"),
     "street_address": ("pii_level", "redacted_address"),
@@ -150,6 +151,7 @@ _CLASS_TO_GOVERNED: dict[str, tuple[str, str]] = {
     "credit_card_number": ("pci_level", "masked_card_last4"),
     "card_number": ("pci_level", "masked_card_last4"),
     "pan": ("pci_level", "masked_card_last4"),
+    "card_security_code": ("pci_level", "redacted_cvv"),
     "cvv": ("pci_level", "redacted_cvv"),
     "cvc": ("pci_level", "redacted_cvv"),
 }

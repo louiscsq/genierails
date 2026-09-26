@@ -169,6 +169,17 @@ class TestClassificationSourceFromRunSql:
             ("pii_level", "masked_ssn", CLASSIFICATION)
         ]
 
+    def test_non_absent_results_error_propagates(self):
+        # from_run_sql must NOT swallow a permission/other results error as an
+        # empty read — it propagates so callers can fail closed.
+        def fake_run_sql(sql):
+            if "column_tags" in sql:
+                return [["cat", "sch", "tbl", "email", "class.email", ""]]
+            raise RuntimeError("permission denied on system.data_classification.results")
+
+        with pytest.raises(RuntimeError, match="permission denied"):
+            ClassificationSource.from_run_sql(fake_run_sql, ["cat.sch.tbl"])
+
     def test_wildcard_refs_are_skipped(self):
         calls = []
 
@@ -290,13 +301,66 @@ class TestScanStates:
         assert scan.state == SCAN_ERROR
         assert scan.source is None
 
-    def test_missing_results_table_alone_is_tolerated(self):
+    def test_absent_results_table_alone_is_tolerated(self):
+        # (a) A genuine "table or view not found" on the OPTIONAL results table
+        # is tolerated: column_tags still make this a classified scan.
         def run_sql(sql):
             if "column_tags" in sql:
                 return [["c", "s", "t", "email", "class.email", ""]]
-            raise RuntimeError("results table missing")
+            raise RuntimeError(
+                "[TABLE_OR_VIEW_NOT_FOUND] The table or view "
+                "`system`.`data_classification`.`results` cannot be found."
+            )
         scan = scan_from_run_sql(run_sql, ["c.s.t"])
         assert scan.state == SCAN_CLASSIFIED
+
+    def test_missing_results_schema_is_tolerated(self):
+        # A missing system.data_classification SCHEMA is also "absent".
+        def run_sql(sql):
+            if "column_tags" in sql:
+                return [["c", "s", "t", "email", "class.email", ""]]
+            raise RuntimeError(
+                "[SCHEMA_NOT_FOUND] The schema `system`.`data_classification` cannot be found."
+            )
+        scan = scan_from_run_sql(run_sql, ["c.s.t"])
+        assert scan.state == SCAN_CLASSIFIED
+
+    def test_results_permission_error_fails_closed_despite_tags(self):
+        # (b) BLOCKING regression: a permission/other error on the AUTHORITATIVE
+        # results table must NOT be swallowed as "absent" — even though
+        # column_tags returned rows, the scan fails closed as SCAN_ERROR.
+        def run_sql(sql):
+            if "column_tags" in sql:
+                return [["c", "s", "t", "email", "class.email", ""]]
+            raise RuntimeError(
+                "[INSUFFICIENT_PERMISSIONS] User does not have SELECT on "
+                "system.data_classification.results"
+            )
+        scan = scan_from_run_sql(run_sql, ["c.s.t"])
+        assert scan.state == SCAN_ERROR
+        assert scan.is_classified is False
+        assert scan.source is None
+
+    def test_results_warehouse_timeout_fails_closed(self):
+        def run_sql(sql):
+            if "column_tags" in sql:
+                return [["c", "s", "t", "email", "class.email", ""]]
+            raise RuntimeError("statement execution timed out on the SQL warehouse")
+        scan = scan_from_run_sql(run_sql, ["c.s.t"])
+        assert scan.state == SCAN_ERROR
+
+    def test_results_schema_drift_fails_closed(self):
+        # Schema drift (renamed/removed column) says "not found" but is a real
+        # error, not an absent table.
+        def run_sql(sql):
+            if "column_tags" in sql:
+                return [["c", "s", "t", "email", "class.email", ""]]
+            raise RuntimeError(
+                "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column with name `class_tag` "
+                "cannot be resolved."
+            )
+        scan = scan_from_run_sql(run_sql, ["c.s.t"])
+        assert scan.state == SCAN_ERROR
 
     def test_states_are_distinct(self):
         classified = scan_from_run_sql(
@@ -333,6 +397,66 @@ class TestClassificationDecision:
         scan = ClassificationScan(SCAN_UNAVAILABLE, None, "no warehouse")
         assert classification_decision(scan, False) != DECISION_USE_LLM
         assert classification_decision(scan, False) != DECISION_USE_CLASSIFICATION
+
+
+# ---------------------------------------------------------------------------
+# main()-level wiring: _resolve_classification_source (BLOCKING #2 follow-up)
+# ---------------------------------------------------------------------------
+# These exercise the ACTUAL glue main() uses (scan -> decision -> exit/continue/
+# log), so they fail if main() stops calling the decision or stops exiting 3 —
+# unlike tests that only call classification_decision() directly.
+class TestResolveClassificationSource:
+    def _patch_scan(self, monkeypatch, scan):
+        import generate_abac
+        monkeypatch.setattr(generate_abac, "_scan_native_classification",
+                            lambda table_refs, auth_cfg: scan)
+        return generate_abac
+
+    @pytest.mark.parametrize("state", [SCAN_UNAVAILABLE, SCAN_ERROR, SCAN_NO_TAGS])
+    def test_inconclusive_scan_exits_3(self, monkeypatch, capsys, state):
+        ga = self._patch_scan(monkeypatch, ClassificationScan(state, None, "detail"))
+        with pytest.raises(SystemExit) as exc:
+            ga._resolve_classification_source(["c.s.t"], {}, "full", allow_llm_sensitivity=False)
+        assert exc.value.code == 3
+        assert "FAIL-CLOSED" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("state", [SCAN_UNAVAILABLE, SCAN_ERROR, SCAN_NO_TAGS])
+    def test_opt_in_continues_without_exit(self, monkeypatch, capsys, state):
+        ga = self._patch_scan(monkeypatch, ClassificationScan(state, None, "detail"))
+        # opt-in must NOT exit; returns None (LLM fallback) and logs the state.
+        result = ga._resolve_classification_source(
+            ["c.s.t"], {}, "full", allow_llm_sensitivity=True
+        )
+        assert result is None
+        out = capsys.readouterr().out
+        assert "UNVERIFIED" in out
+        assert state in out  # the DISTINCT state is surfaced, not masked
+
+    def test_classified_scan_returns_source(self, monkeypatch, capsys):
+        src = ClassificationSource(tag_rows=[("c", "s", "t", "email", "class.email", "")])
+        ga = self._patch_scan(
+            monkeypatch, ClassificationScan(SCAN_CLASSIFIED, src, "1 classified column(s)")
+        )
+        result = ga._resolve_classification_source(
+            ["c.s.t"], {}, "full", allow_llm_sensitivity=False
+        )
+        assert result is src
+        assert "authoritative" in capsys.readouterr().out
+
+    def test_genie_mode_skips_scan(self, monkeypatch):
+        import generate_abac
+        called = {"n": 0}
+
+        def _boom(table_refs, auth_cfg):
+            called["n"] += 1
+            raise AssertionError("scan should not run in genie mode")
+
+        monkeypatch.setattr(generate_abac, "_scan_native_classification", _boom)
+        result = generate_abac._resolve_classification_source(
+            ["c.s.t"], {}, "genie", allow_llm_sensitivity=False
+        )
+        assert result is None
+        assert called["n"] == 0
 
 
 # ---------------------------------------------------------------------------

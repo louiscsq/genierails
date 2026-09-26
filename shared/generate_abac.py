@@ -1742,6 +1742,61 @@ def _scan_native_classification(
         return ClassificationScan(SCAN_ERROR, None, f"could not connect / scan: {exc}")
 
 
+def _resolve_classification_source(
+    table_refs: list[str] | None,
+    auth_cfg: dict,
+    mode: str,
+    allow_llm_sensitivity: bool,
+) -> SensitivitySource | None:
+    """Scan native classification and apply the fail-closed decision.
+
+    This is the wiring main() relies on, factored out so it is unit-testable:
+    scan → :func:`classification_decision` → act.
+
+    * ``DECISION_USE_CLASSIFICATION`` → return the authoritative source.
+    * ``DECISION_FAIL_CLOSED`` (inconclusive scan, no opt-in) → log the DISTINCT
+      state and abort the process with ``exit code 3``.
+    * ``DECISION_USE_LLM`` (explicit opt-in) → return ``None`` (LLM fallback),
+      logging the distinct unverified state rather than masking it.
+
+    In ``genie`` mode tag_assignments are governance-owned, so no scan runs and
+    ``None`` is returned unconditionally.
+    """
+    if mode == "genie":
+        return None
+
+    scan = _scan_native_classification(table_refs, auth_cfg)
+    decision = classification_decision(scan, allow_llm_sensitivity)
+
+    if decision == DECISION_USE_CLASSIFICATION:
+        print(
+            "  [SENSITIVITY] Native UC Data Classification is authoritative "
+            f"({scan.detail})"
+        )
+        return scan.source
+
+    if decision == DECISION_FAIL_CLOSED:
+        fatal = scan.state in (SCAN_UNAVAILABLE, SCAN_ERROR)
+        print(
+            "  [SENSITIVITY] FAIL-CLOSED: native classification could not be "
+            f"confirmed (state={scan.state}: {scan.detail}). Sensitivity was NOT "
+            "natively verified, so LLM/DDL inference is UNTRUSTED. Re-run against a "
+            "working SQL warehouse with UC Data Classification, or pass "
+            "--allow-llm-sensitivity / GENIERAILS_ALLOW_LLM_SENSITIVITY=1 to accept "
+            "LLM-inferred sensitivity."
+            + ("" if fatal else " (A clean scan found no class.* tags — the tables "
+               "may not be classified yet.)")
+        )
+        sys.exit(3)
+
+    # DECISION_USE_LLM — explicit opt-in; surface the distinct state, don't mask it.
+    print(
+        "  [SENSITIVITY] Proceeding with LLM/DDL-inferred sensitivity "
+        f"(UNVERIFIED, opt-in): native scan state={scan.state} ({scan.detail})"
+    )
+    return None
+
+
 def autofix_tag_policies(tfvars_path: Path) -> int:
     """Add tag values used in assignments/policies but missing from tag_policies.
 
@@ -7056,37 +7111,12 @@ Before you apply, tune for your business roles, security requirements, and Genie
         # Classification (class.* tags) is authoritative when present.  When the
         # scan is inconclusive — unavailable, errored, or a clean read with no
         # class.* tags — we do NOT silently trust LLM/DDL inference: the run
-        # aborts unless --allow-llm-sensitivity (or GENIERAILS_ALLOW_LLM_SENSITIVITY)
-        # explicitly downgrades it to an LLM fallback.
-        classification_source = None
-        if args.mode != "genie":
-            scan = _scan_native_classification(table_refs, auth_cfg)
-            decision = classification_decision(scan, args.allow_llm_sensitivity)
-            if decision == DECISION_USE_CLASSIFICATION:
-                classification_source = scan.source
-                print(
-                    "  [SENSITIVITY] Native UC Data Classification is authoritative "
-                    f"({scan.detail})"
-                )
-            elif decision == DECISION_FAIL_CLOSED:
-                fatal = scan.state in (SCAN_UNAVAILABLE, SCAN_ERROR)
-                print(
-                    "  [SENSITIVITY] FAIL-CLOSED: native classification could not be "
-                    f"confirmed (state={scan.state}: {scan.detail}). Sensitivity was NOT "
-                    "natively verified, so LLM/DDL inference is UNTRUSTED. Re-run against a "
-                    "working SQL warehouse with UC Data Classification, or pass "
-                    "--allow-llm-sensitivity / GENIERAILS_ALLOW_LLM_SENSITIVITY=1 to accept "
-                    "LLM-inferred sensitivity."
-                    + ("" if fatal else " (A clean scan found no class.* tags — the tables "
-                       "may not be classified yet.)")
-                )
-                sys.exit(3)
-            else:  # DECISION_USE_LLM — explicit opt-in; surface the distinct state
-                classification_source = None
-                print(
-                    "  [SENSITIVITY] Proceeding with LLM/DDL-inferred sensitivity "
-                    f"(UNVERIFIED, opt-in): native scan state={scan.state} ({scan.detail})"
-                )
+        # aborts (exit 3) unless --allow-llm-sensitivity (or
+        # GENIERAILS_ALLOW_LLM_SENSITIVITY) explicitly downgrades it to an LLM
+        # fallback.  See _resolve_classification_source.
+        classification_source = _resolve_classification_source(
+            table_refs, auth_cfg, args.mode, args.allow_llm_sensitivity,
+        )
 
         # Skip PII autofix in genie mode — tag_assignments are managed by the governance team
         if args.mode != "genie":

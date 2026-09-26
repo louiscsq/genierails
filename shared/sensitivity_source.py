@@ -209,7 +209,8 @@ class ClassificationSource(SensitivitySource):
     the ``class.*`` namespace contribute.
 
     ``classification_rows``: iterable of ``(catalog, schema, table, column,
-    class_name)`` from ``system.data_classification.results`` (optional).
+    class_tag)`` from ``system.data_classification.results`` (optional), where
+    ``class_tag`` is the native semantic (e.g. ``class.us_ssn`` or ``us_ssn``).
     """
 
     name = CLASSIFICATION
@@ -235,14 +236,18 @@ class ClassificationSource(SensitivitySource):
         """Build by querying the system tables via an injected ``run_sql``.
 
         ``run_sql(sql) -> rows`` mirrors ``audit_schema_drift._run_sql`` (returns
-        a list of row lists).  Reads are best-effort: the column_tags read is
-        required, but a missing ``system.data_classification.results`` table is
-        tolerated so this works on workspaces without that surface.
+        a list of row lists).  The column_tags read is required.  Only a
+        positively-identified *missing* ``system.data_classification.results``
+        table/schema is tolerated (that surface is optional); any OTHER results
+        read failure (permission denied, warehouse/SQL error, timeout, schema
+        drift) PROPAGATES rather than being masked as an empty read.
         """
         tag_rows = _read_class_column_tags(run_sql, table_refs)
         try:
             classification_rows = _read_data_classification_results(run_sql, table_refs)
-        except Exception:
+        except Exception as exc:
+            if not _is_relation_absent_error(exc):
+                raise
             classification_rows = []
         return cls(tag_rows=tag_rows, classification_rows=classification_rows, mapping=mapping)
 
@@ -449,6 +454,37 @@ WHERE concat(catalog_name, '.', schema_name, '.', table_name) IN ({table_list})"
     return [tuple(row) for row in (run_sql(sql) or [])]
 
 
+def _is_relation_absent_error(exc: Exception) -> bool:
+    """True ONLY for a positively-identified missing table/view/schema.
+
+    A missing ``system.data_classification.results`` table (or its
+    ``system.data_classification`` schema) is the one condition we tolerate as
+    "results simply not present on this workspace".  Every other failure —
+    permission/access denied, warehouse or SQL execution error, timeout, and
+    schema drift (a missing/renamed column such as ``class_tag``) — is NOT
+    absent and must propagate so the scan fails closed.
+
+    Deliberately conservative: over-matching "absent" would re-introduce the
+    fail-closed hole (silently swallowing a real error), so only high-precision
+    relation-not-found tokens qualify, and column-level errors are excluded
+    outright.
+    """
+    msg = str(exc).lower()
+    # Schema drift (missing/renamed column) is a real error, never "absent" —
+    # even though such messages can also contain the phrase "not found".
+    if "unresolved_column" in msg or "column_not_found" in msg:
+        return False
+    absent_tokens = (
+        "table_or_view_not_found",   # Databricks/Spark error condition
+        "table or view not found",   # classic phrasing
+        "schema_not_found",          # missing system.data_classification schema
+        "no such table",
+        "no such view",
+        "no such schema",
+    )
+    return any(tok in msg for tok in absent_tokens)
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed scan resolution
 # ---------------------------------------------------------------------------
@@ -497,8 +533,15 @@ def scan_from_run_sql(
     Distinguishes: no concrete tables → :data:`SCAN_UNAVAILABLE`; a failed
     ``column_tags`` read → :data:`SCAN_ERROR`; tags present →
     :data:`SCAN_CLASSIFIED`; a clean read with no ``class.*`` tags →
-    :data:`SCAN_NO_TAGS`.  A missing ``data_classification.results`` table alone
-    is tolerated (it is supplementary to ``column_tags``).
+    :data:`SCAN_NO_TAGS`.
+
+    The ``data_classification.results`` read is supplementary to
+    ``column_tags``, but its failures are NOT blanket-tolerated: only a
+    positively-identified *missing* results table/schema is treated as
+    "absent".  Any other results read failure (permission denied, warehouse/SQL
+    error, timeout, schema drift) resolves to :data:`SCAN_ERROR` so the scan
+    fails closed — an unreadable AUTHORITATIVE results table must never be
+    mistaken for "nothing classified" just because ``column_tags`` had rows.
     """
     fqns = _table_fqns_from_refs(table_refs)
     if not fqns:
@@ -511,8 +554,14 @@ def scan_from_run_sql(
         return ClassificationScan(SCAN_ERROR, None, f"column_tags read failed: {exc}")
     try:
         class_rows = _read_data_classification_results(run_sql, fqns)
-    except Exception:
-        class_rows = []
+    except Exception as exc:
+        if _is_relation_absent_error(exc):
+            class_rows = []  # results surface simply not present — tolerated
+        else:
+            return ClassificationScan(
+                SCAN_ERROR, None,
+                f"data_classification.results read failed (not absent): {exc}",
+            )
     source = ClassificationSource(tag_rows=tag_rows, classification_rows=class_rows, mapping=mapping)
     if source.has_native_data():
         return ClassificationScan(

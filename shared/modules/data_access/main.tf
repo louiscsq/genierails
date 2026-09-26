@@ -20,8 +20,8 @@ data "databricks_group" "existing" {
   for_each = var.groups
 
   # Data-access principals must be resolvable in the workspace where grants
-  # and policies are applied. This supports both account groups assigned to the
-  # workspace and disposable workspace-local groups used by CLI-profile flows.
+  # and policies are applied. Account groups assigned to this workspace are
+  # visible here; workspace-local groups are not valid Unity Catalog principals.
   provider     = databricks.workspace
   display_name = each.key
 }

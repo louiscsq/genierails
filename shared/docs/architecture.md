@@ -75,7 +75,7 @@ Where to find each field:
 
 Service principal requirements:
 
-- `Account Admin` to create account groups and assign them to the workspace
+- `Account Admin` to look up the IdP-synced access-tier groups and assign them to the workspace (and, only in the opt-in demo/greenfield create path with `manage_groups = true`, to create account groups)
 - `Workspace Admin` to configure workspace entitlements, warehouses, and Genie resources
 - `Metastore Admin` to create tag policies, FGAC policies, grants, and masking functions
 

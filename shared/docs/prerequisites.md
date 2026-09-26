@@ -79,7 +79,7 @@ GenieRails **consumes** the access-tier groups your identity provider owns; it d
 
 Ownership is split: the **IdP owns groups and membership**; **GenieRails owns grants and ABAC** (tags, FGAC policies, Genie ACLs). `make generate` preflights the referenced group→tier mapping and fails loudly if a group isn't synced. See [IdP-Synced Groups](advanced.md#idp-synced-groups-default).
 
-> **Demo / greenfield only:** if no IdP is syncing groups yet, `make generate --create-groups` plus `manage_groups = true` in `envs/account/env.auto.tfvars` lets GenieRails mint the groups itself (opt-in, off by default).
+> **Demo / greenfield only:** if no IdP is syncing groups yet, `make generate GENERATE_ARGS='--create-groups'` plus `manage_groups = true` in `envs/account/env.auto.tfvars` lets GenieRails mint the groups itself (opt-in, off by default).
 
 ### Service Principal
 

@@ -43,3 +43,11 @@ def test_select_is_not_granted_at_namespace_level():
     assert '"SELECT"' not in _resource_body(source, "schema_access")
     assert '"USE_CATALOG"' not in _resource_body(source, "table_access")
     assert '"USE_SCHEMA"' not in _resource_body(source, "table_access")
+
+
+def test_business_select_is_fail_closed_while_structural_grants_remain():
+    source = MAIN_TF.read_text()
+
+    assert "for_each = var.business_access_enabled ? {" in _resource_body(source, "table_access")
+    assert "var.business_access_enabled" not in _resource_body(source, "catalog_access")
+    assert "var.business_access_enabled" not in _resource_body(source, "schema_access")

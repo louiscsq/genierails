@@ -36,7 +36,7 @@ output "genie_space_acls_applied" {
 
 output "genie_space_acls_groups" {
   description = "Per-space groups granted CAN_RUN on each Genie Space."
-  value = local.genie_space_groups
+  value       = local.genie_space_groups
 }
 
 output "genie_spaces_created" {

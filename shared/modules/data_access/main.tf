@@ -124,10 +124,10 @@ resource "databricks_grant" "schema_access" {
 }
 
 resource "databricks_grant" "table_access" {
-  for_each = {
+  for_each = var.business_access_enabled ? {
     for pair in setproduct(var.uc_tables, keys(var.groups)) :
     "${pair[0]}|${pair[1]}" => { table = pair[0], group = pair[1] }
-  }
+  } : {}
 
   provider   = databricks.workspace
   table      = each.value.table

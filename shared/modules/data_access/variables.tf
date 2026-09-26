@@ -33,6 +33,12 @@ variable "uc_tables" {
   description = "Optional UC table list used to derive catalogs for grants."
 }
 
+variable "business_access_enabled" {
+  type        = bool
+  default     = false
+  description = "Fail-closed exposure gate. Set true only after the coverage gate and schema drift check pass; controls business-group SELECT grants."
+}
+
 variable "tag_assignments" {
   type = list(object({
     entity_type = string

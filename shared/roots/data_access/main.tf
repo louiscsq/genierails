@@ -83,6 +83,12 @@ variable "uc_tables" {
   default = []
 }
 
+variable "business_access_enabled" {
+  type        = bool
+  default     = false
+  description = "Fail-closed exposure gate. Enable only after coverage validation and the schema drift check pass."
+}
+
 variable "manage_groups" {
   type    = bool
   default = false
@@ -218,14 +224,15 @@ module "data_access" {
   databricks_client_id      = var.databricks_client_id
   databricks_client_secret  = var.databricks_client_secret
   databricks_workspace_host = var.databricks_workspace_host
-  groups                   = var.groups
-  uc_tables                = local.full_uc_tables
-  tag_assignments          = var.tag_assignments
-  fgac_policies            = var.fgac_policies
-  sql_warehouse_id         = var.sql_warehouse_id
-  warehouse_name           = var.warehouse_name
-  masking_sql_file         = "${var.env_dir}/masking_functions.sql"
-  deploy_masking_script    = "${local.project_root}/deploy_masking_functions.py"
+  groups                    = var.groups
+  uc_tables                 = local.full_uc_tables
+  business_access_enabled   = var.business_access_enabled
+  tag_assignments           = var.tag_assignments
+  fgac_policies             = var.fgac_policies
+  sql_warehouse_id          = var.sql_warehouse_id
+  warehouse_name            = var.warehouse_name
+  masking_sql_file          = "${var.env_dir}/masking_functions.sql"
+  deploy_masking_script     = "${local.project_root}/deploy_masking_functions.py"
 }
 
 output "sql_warehouse_id" {

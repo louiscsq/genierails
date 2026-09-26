@@ -41,6 +41,9 @@ vi envs/dev/generated/masking_functions.sql
 # Review and iterate on the generated masking and row-filter functions.
 
 make validate-generated
+# Confirm `make audit-schema` is clean, then release business access in
+# envs/dev/env.auto.tfvars:
+#   business_access_enabled = true
 make apply
 ```
 
@@ -50,6 +53,13 @@ make apply
 2. `make generate` fetches DDLs from Unity Catalog, calls the LLM, and writes a draft into `envs/dev/generated/`
 3. You tune the generated governance and Genie config
 4. `make apply` splits the generated draft into layered configs and applies all three layers
+
+Business exposure is fail-closed. With the default `business_access_enabled = false`,
+apply creates the enforcement scaffolding and may create/configure Genie Spaces, but
+it withholds business-group table `SELECT` and Genie `CAN_RUN` ACLs. Set the flag to
+`true` only after the coverage validation and schema drift check are green. Space
+creation remains ungated so administrators can finish and inspect its configuration
+before releasing it to business users.
 
 ## Multiple Genie Spaces and multiple catalogs
 

@@ -2,6 +2,13 @@
 
 This document lists everything that must be in place for business users (the groups defined in `abac.auto.tfvars`) to use an AI/BI Genie Space.
 
+Business exposure is fail-closed. `business_access_enabled` defaults to `false`,
+which withholds table `SELECT` and Genie Space business-group ACLs while retaining
+the structural grants and resources needed to prepare the environment. Set it to
+`true` only after the coverage gate (`make validate-generated`) and schema drift
+check (`make audit-schema`) pass. Genie Space creation and configuration are not
+gated, so administrators can inspect them before granting business access.
+
 ## 1. Identity
 
 - **Business groups:** Created at account level (Terraform: `module.account.databricks_group` via `roots/account/main.tf`).

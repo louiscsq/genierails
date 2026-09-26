@@ -17,29 +17,48 @@ python ../../generate_abac.py --tables "a.b.*" "c.d.e"
 python ../../generate_abac.py --dry-run
 ```
 
-Pass group names through Make:
+Pass the group→tier mapping through Make:
 
 ```bash
 make generate GENERATE_ARGS='--groups "Finance_Analyst,Clinical_Staff"'
 ```
 
-## IDP-Synced Groups
+## IdP-Synced Groups (default)
 
-When groups are managed by an identity provider such as Okta or Azure AD, keep group ownership out of workspace and `data_access` envs entirely. Those layers already look groups up by name. The only place that mentions `manage_groups` is `envs/account/env.auto.tfvars`, where it remains `true` if Terraform should own account-level group creation.
+**GenieRails consumes IdP-owned groups by default; it never mints them in the normal path.** Ownership is split cleanly:
 
-This changes behavior:
+- **The IdP owns groups and membership.** Enable [AIM](#prerequisite-sync-your-idp-groups) (or SCIM where AIM isn't available) so your identity provider — Okta, Azure AD/Entra ID, etc. — syncs the access-tier groups into the Databricks account.
+- **GenieRails owns grants and ABAC.** It looks the synced groups up by name and attaches tags, FGAC policies, and Genie Space ACLs to them.
 
-- Groups are looked up by name instead of created
-- Workspace assignment and entitlements still run
-- Any account-level `group_members` should stay empty in `envs/account/abac.auto.tfvars`
+### Prerequisite: sync your IdP groups
 
-Use `--groups` to tell the LLM your exact IDP group names:
+Before running `make apply`, the access-tier groups must already exist as account-level groups, synced from your IdP:
+
+- **AIM (Automatic Identity Management)** — the preferred path. Databricks provisions users and groups from your IdP automatically.
+- **SCIM provisioning** — use this where AIM isn't available for your IdP. Configure a SCIM connector from the IdP to the Databricks account.
+
+### How consume-by-default works
+
+- The **group→tier mapping** (which existing IdP group fills each access tier) is the primary, expected input. Provide it with `--groups`:
+
+  ```bash
+  make generate GENERATE_ARGS='--groups "acme-finance-readers,acme-clinical-staff,acme-compliance"'
+  ```
+
+  The LLM uses these exact names in generated FGAC policies, tag assignments, and Genie Space ACLs — it does not invent new ones.
+- `manage_groups` defaults to **`false`** everywhere (account, `data_access`, and workspace layers). All three layers look groups up by name via `data "databricks_group"`; none create them.
+- **Group-existence preflight:** `make generate` verifies every referenced group is synced into the account. If one is missing, generation **fails loudly and names the missing group**, telling you to enable AIM/SCIM (or fix the name) — rather than silently producing a grant that matches nobody. (The preflight is skipped only when account credentials aren't available; the account layer's `data "databricks_group"` lookup then fails at apply time instead.)
+- `group_members` stays empty in `envs/account/abac.auto.tfvars` — the IdP owns membership.
+
+### Opt-in group creation (demo / greenfield only)
+
+For a demo or greenfield account with no IdP syncing groups yet, GenieRails can still mint them. This is **opt-in and off by default**:
 
 ```bash
-make generate GENERATE_ARGS='--groups "acme-finance-readers,acme-clinical-staff,acme-compliance"'
+make generate GENERATE_ARGS='--create-groups'
 ```
 
-The LLM uses these exact names in generated FGAC policies, tag assignments, and Genie Space ACLs.
+`--create-groups` lets the LLM invent access-tier names and skips the preflight. To have Terraform create them, also set `manage_groups = true` in `envs/account/env.auto.tfvars` (the only place that flag belongs). Keep workspace and `data_access` envs on the default `manage_groups = false` (lookup-only) regardless.
 
 ## ABAC-Only Mode (No Genie Space)
 

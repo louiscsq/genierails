@@ -102,7 +102,7 @@ genie_spaces = [
 sql_warehouse_id = ""   # shared fallback; empty = auto-create serverless
 ```
 
-Only `envs/account/env.auto.tfvars` should include `manage_groups = true`. Workspace and `data_access` env files should omit that field and rely on their built-in lookup-only defaults.
+`manage_groups` defaults to `false` on every layer (account, `data_access`, workspace): groups are **consumed** — looked up by name from the IdP-synced account groups — not created. This is the normal path. Only for a demo/greenfield account with no IdP-synced groups should `envs/account/env.auto.tfvars` set `manage_groups = true` (opt-in group creation); workspace and `data_access` env files always stay on the lookup-only default. See [IdP-Synced Groups](advanced.md#idp-synced-groups-default).
 
 ### `abac.auto.tfvars`
 
@@ -162,4 +162,4 @@ All nine fields are included in the `serialized_space` when a new Genie Space is
 
 Notes:
 
-- `make plan ENV=<workspace>` assumes the referenced groups already exist, either because `make apply ENV=account` has run or because those groups were imported or are IDP-synced already
+- `make plan ENV=<workspace>` assumes the referenced groups already exist — normally because they are IdP-synced (via AIM, or SCIM where AIM isn't available), or, in an opt-in demo/greenfield deployment, because `make apply ENV=account` created them with `manage_groups = true`

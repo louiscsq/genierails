@@ -70,6 +70,17 @@ No VPN is required unless your Databricks workspace is on a private network.
 - **SQL Warehouse** — serverless (auto-created) or existing warehouse
 - **Genie Spaces** — for the Genie Space governance workflow
 
+### Identity Provider group sync (required)
+
+GenieRails **consumes** the access-tier groups your identity provider owns; it does not create them in the normal path. Before running `make generate` / `make apply`, make sure your IdP groups are synced into the Databricks account:
+
+- **AIM (Automatic Identity Management)** — the preferred path. Databricks automatically provisions users and groups from your IdP (Okta, Azure AD/Entra ID, etc.).
+- **SCIM provisioning** — use where AIM isn't available for your IdP. Configure a SCIM connector from the IdP to the Databricks account.
+
+Ownership is split: the **IdP owns groups and membership**; **GenieRails owns grants and ABAC** (tags, FGAC policies, Genie ACLs). `make generate` preflights the referenced group→tier mapping and fails loudly if a group isn't synced. See [IdP-Synced Groups](advanced.md#idp-synced-groups-default).
+
+> **Demo / greenfield only:** if no IdP is syncing groups yet, `make generate --create-groups` plus `manage_groups = true` in `envs/account/env.auto.tfvars` lets GenieRails mint the groups itself (opt-in, off by default).
+
 ### Service Principal
 
 Create a service principal (SP) in the Databricks Account Console with:

@@ -20,9 +20,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import generate_abac
 from generate_abac import (
     GroupPreflightError,
+    build_prompt,
     find_missing_idp_groups,
+    main,
     preflight_consume_groups,
 )
 
@@ -101,6 +104,22 @@ def _block_for_each(tf: dict, kind: str, block_type: str, block_name: str) -> st
     raise AssertionError(f"{kind} {block_type}.{block_name} not found")
 
 
+def _parse_ternary(expr: str) -> tuple[str, str, str]:
+    """Parse ``${cond ? true_branch : false_branch}`` into its three parts.
+
+    Asserting the branch orientation (not just substring presence) is the point:
+    a reversed ternary like ``var.manage_groups ? {} : var.groups`` must FAIL the
+    consume/create wiring tests, which a substring check would not catch.
+    """
+    inner = expr.strip()
+    assert inner.startswith("${") and inner.endswith("}"), f"not an interpolation: {expr!r}"
+    inner = inner[2:-1].strip()
+    assert "?" in inner and ":" in inner, f"not a ternary: {expr!r}"
+    cond, rest = inner.split("?", 1)
+    true_branch, false_branch = rest.split(":", 1)
+    return cond.strip(), true_branch.strip(), false_branch.strip()
+
+
 class TestAccountModuleConsumeByDefault:
     def test_module_manage_groups_defaults_to_false(self):
         tf = _load_tf(ACCOUNT_MODULE / "variables.tf")
@@ -110,27 +129,41 @@ class TestAccountModuleConsumeByDefault:
         tf = _load_tf(ACCOUNT_ROOT / "main.tf")
         assert _variable_default(tf, "manage_groups") is False
 
-    def test_default_path_looks_up_groups_via_data_source(self):
+    def test_consumed_data_source_orientation_consume_on_false(self):
+        # data.databricks_group.consumed drives the CONSUME (lookup) path.
+        # Orientation must be: manage_groups ? {} : var.groups
+        #   true  (managing/create) -> {}         (no lookup)
+        #   false (default/consume) -> var.groups (look them up)
         tf = _load_tf(ACCOUNT_MODULE / "main.tf")
-        fe = _block_for_each(tf, "data", "databricks_group", "consumed")
-        # Consumes var.groups when NOT managing (the default false branch).
-        assert "manage_groups" in fe
-        assert "var.groups" in fe
-        # Empty in the manage/create branch — no lookup when we create.
-        assert "{}" in fe
+        cond, true_b, false_b = _parse_ternary(
+            _block_for_each(tf, "data", "databricks_group", "consumed")
+        )
+        assert "manage_groups" in cond
+        assert true_b == "{}", f"expected empty lookup when managing, got {true_b!r}"
+        assert "var.groups" in false_b, f"expected consume on false, got {false_b!r}"
 
-    def test_default_path_does_not_create_groups(self):
+    def test_group_resource_orientation_create_on_true(self):
+        # resource.databricks_group.groups drives the CREATE path.
+        # Orientation must be: manage_groups ? var.groups : {}
+        #   true  (create) -> var.groups (mint them)
+        #   false (default) -> {}        (mint nothing)
         tf = _load_tf(ACCOUNT_MODULE / "main.tf")
-        fe = _block_for_each(tf, "resource", "databricks_group", "groups")
-        # Creation is gated on manage_groups; empty map otherwise (default).
-        assert "manage_groups" in fe
-        assert "var.groups" in fe
+        cond, true_b, false_b = _parse_ternary(
+            _block_for_each(tf, "resource", "databricks_group", "groups")
+        )
+        assert "manage_groups" in cond
+        assert "var.groups" in true_b, f"expected create on true, got {true_b!r}"
+        assert false_b == "{}", f"expected no creation by default, got {false_b!r}"
 
-    def test_membership_not_managed_by_default(self):
+    def test_membership_resource_orientation_manage_on_true(self):
+        # Membership is only managed in the create path (true branch).
         tf = _load_tf(ACCOUNT_MODULE / "main.tf")
-        fe = _block_for_each(tf, "resource", "databricks_group_member", "members")
-        assert "manage_groups" in fe
-        assert "local.group_member_map" in fe
+        cond, true_b, false_b = _parse_ternary(
+            _block_for_each(tf, "resource", "databricks_group_member", "members")
+        )
+        assert "manage_groups" in cond
+        assert "local.group_member_map" in true_b
+        assert false_b == "{}", f"expected no membership by default, got {false_b!r}"
 
     def test_opt_in_create_path_still_present(self):
         # The databricks_group resource (create path) must not be deleted —
@@ -144,3 +177,147 @@ class TestAccountModuleConsumeByDefault:
             for name in named
         }
         assert "groups" in names
+
+
+# ---------------------------------------------------------------------------
+# build_prompt — group-invention instructions gated behind create mode
+# ---------------------------------------------------------------------------
+DDL = "CREATE TABLE cat.sch.tbl (id INT, ssn STRING);"
+
+
+class TestBuildPromptGrouping:
+    def test_consume_mode_strips_invention_instructions(self):
+        prompt = build_prompt(DDL, group_names=["Finance_Analyst", "Admin"], create_groups=False)
+        # The template's invent-groups steps must be gone.
+        assert "Propose groups" not in prompt
+        assert "Create **groups** (access tiers" not in prompt
+        # The supplied names are pinned and invention is forbidden.
+        assert "REQUIRED GROUP NAMES" in prompt
+        assert "Finance_Analyst" in prompt
+        assert "do NOT propose or invent new groups" in prompt
+
+    def test_consume_mode_is_the_default(self):
+        # No create_groups kwarg => consume (invention stripped).
+        prompt = build_prompt(DDL, group_names=["Finance_Analyst"])
+        assert "Propose groups" not in prompt
+
+    def test_create_mode_keeps_invention_instructions(self):
+        prompt = build_prompt(DDL, create_groups=True)
+        assert "Propose groups" in prompt
+        assert "Create **groups** (access tiers" in prompt
+
+
+# ---------------------------------------------------------------------------
+# CLI wiring — argparse mutual exclusion + main() default/consume/create paths
+#
+# These exercise main() itself (not just the pure helper) so a regression that
+# lets the default path invent groups, or bypasses the preflight, is caught.
+# ---------------------------------------------------------------------------
+def _patch_common(monkeypatch, *, account_groups=None):
+    """Stub out the heavy deps so main() runs offline up to build_prompt."""
+    monkeypatch.setattr(generate_abac, "load_auth_config", lambda *a, **k: {})
+    monkeypatch.setattr(
+        generate_abac, "fetch_tables_from_databricks",
+        lambda *a, **k: (DDL, [("cat", "sch")]),
+    )
+    monkeypatch.setattr(
+        generate_abac, "list_account_group_names",
+        lambda *a, **k: account_groups,
+    )
+
+
+class TestCliGroupMode:
+    def test_groups_and_create_groups_are_mutually_exclusive(self, monkeypatch):
+        # argparse rejects the contradictory combination with exit code 2.
+        monkeypatch.setattr(sys, "argv", [
+            "generate_abac.py", "--groups", "Finance_Analyst", "--create-groups",
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 2
+
+    def test_default_no_flags_errors_and_does_not_invent(self, monkeypatch, tmp_path):
+        # Neither --groups nor --create-groups: main must refuse (exit 1) BEFORE
+        # ever building a prompt, so the LLM is never asked to invent groups.
+        called = {"build_prompt": False}
+        monkeypatch.setattr(
+            generate_abac, "build_prompt",
+            lambda *a, **k: called.__setitem__("build_prompt", True) or "",
+        )
+        _patch_common(monkeypatch)
+        monkeypatch.setattr(sys, "argv", [
+            "generate_abac.py", "--tables", "cat.sch.tbl", "--dry-run",
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+        assert called["build_prompt"] is False, "must not reach prompt building"
+
+    def test_consume_mode_invokes_preflight(self, monkeypatch, tmp_path):
+        # With --groups, main must call the preflight on the consume path.
+        preflight_calls = []
+        monkeypatch.setattr(
+            generate_abac, "preflight_consume_groups",
+            lambda referenced, existing, **k: preflight_calls.append((list(referenced), list(existing))),
+        )
+        build_calls = {}
+        monkeypatch.setattr(
+            generate_abac, "build_prompt",
+            lambda *a, **k: build_calls.update(k) or "",
+        )
+        _patch_common(monkeypatch, account_groups=["Finance_Analyst"])
+        monkeypatch.setattr(sys, "argv", [
+            "generate_abac.py", "--groups", "Finance_Analyst",
+            "--tables", "cat.sch.tbl", "--dry-run",
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 0  # dry-run success
+        assert preflight_calls == [(["Finance_Analyst"], ["Finance_Analyst"])]
+        assert build_calls.get("create_groups") is False
+
+    def test_consume_mode_missing_group_fails_loudly(self, monkeypatch, tmp_path):
+        # Real preflight (not stubbed): a referenced group absent from the account
+        # must abort main with exit 1 before any prompt is built.
+        called = {"build_prompt": False}
+        monkeypatch.setattr(
+            generate_abac, "build_prompt",
+            lambda *a, **k: called.__setitem__("build_prompt", True) or "",
+        )
+        _patch_common(monkeypatch, account_groups=["Real_Group"])
+        monkeypatch.setattr(sys, "argv", [
+            "generate_abac.py", "--groups", "Ghost_Group",
+            "--tables", "cat.sch.tbl", "--dry-run",
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+        assert called["build_prompt"] is False
+
+    def test_create_mode_skips_preflight_and_invents(self, monkeypatch, tmp_path):
+        # --create-groups: preflight is not called and build_prompt gets create_groups=True.
+        preflight_calls = []
+        monkeypatch.setattr(
+            generate_abac, "preflight_consume_groups",
+            lambda *a, **k: preflight_calls.append(a),
+        )
+        build_calls = {}
+        monkeypatch.setattr(
+            generate_abac, "build_prompt",
+            lambda *a, **k: build_calls.update(k) or "",
+        )
+        _patch_common(monkeypatch)
+        monkeypatch.setattr(sys, "argv", [
+            "generate_abac.py", "--create-groups",
+            "--tables", "cat.sch.tbl", "--dry-run",
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 0
+        assert preflight_calls == []
+        assert build_calls.get("create_groups") is True
+        assert build_calls.get("group_names") is None

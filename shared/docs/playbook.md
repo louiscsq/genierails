@@ -85,15 +85,42 @@ These work with any scenario — just add the flag. See [Country Overlays](count
 
 ### Schema drift detection
 
-After ABAC governance is deployed, table schemas may evolve. Two commands handle drift without a full `make generate` re-run:
+After ABAC governance is deployed, table schemas may evolve. These commands handle drift without a full `make generate` re-run:
 
 ```bash
 # Detect untagged columns and stale assignments
 make audit-schema ENV=dev
 
+# Detect prod-applied tags that no policy or mask covers ("new prod tag, no rule")
+make audit-rulebook ENV=dev
+
 # Auto-classify new columns and remove stale ones
 make generate-delta ENV=dev
 make apply ENV=dev
+```
+
+`audit-schema` and `audit-rulebook` are two complementary directions of drift:
+
+| Command | Direction | Detects |
+| --- | --- | --- |
+| `audit-schema` (forward) | column → rule | PII-named columns with no governed tag |
+| `audit-schema` (reverse) | rule → column | tag assignments whose column no longer exists |
+| `audit-rulebook` | applied tag → rule | tags actually applied in the workspace (`class.*` classification + governed keys) that no `tag_policy` declares and no `fgac_policy` mask/row-filter references |
+
+`make audit-rulebook` reads `system.information_schema.column_tags` for the managed
+tables and compares each applied tag key/value against the RULEBOOK (`tag_policies` +
+column-mask `fgac_policies` in the config). It catches the case where an automatic
+classification or an out-of-band `SET TAGS` lands a tag in production that the
+governance config never anticipated — so no mask will act on it. Coverage is matched
+per catalog (a mask in one catalog does not cover a tag in another) and only column
+masks count; a row filter's `when_condition` targets table tags, not column tags.
+
+The `make` targets each run a fixed mode (`audit-schema` → forward + reverse,
+`audit-rulebook` → rulebook). To run all three checks in one pass, invoke the script
+directly from the env directory:
+
+```bash
+cd envs/dev && python3 "$SHARED_ROOT/scripts/audit_schema_drift.py" --mode all
 ```
 
 | Schema change | What happens |
@@ -101,6 +128,7 @@ make apply ENV=dev
 | `ALTER TABLE ADD COLUMN patient_ssn STRING` | `generate-delta` classifies and tags it |
 | `ALTER TABLE DROP COLUMN old_ssn` | `generate-delta` removes the stale assignment |
 | `ALTER TABLE RENAME COLUMN ssn TO tax_id` | Old assignment removed, new column classified |
+| Auto-classifier sets `class.pii` on a new column | `audit-rulebook` flags it — no covering policy or mask |
 
 ---
 

@@ -1,4 +1,5 @@
 import json
+from itertools import permutations
 
 from generate_abac import (
     discover_agent_footprint,
@@ -139,3 +140,59 @@ def test_case_insensitive_wildcard_mix_keeps_all_columns_consistently():
     ])
 
     _assert_scope_matches_membership(footprint, {"email", "ssn"})
+
+
+def test_mixed_case_explicit_then_whole_table_agree():
+    footprint = discover_agent_footprint(declared_footprint=[
+        "Cat.S.T.ssn", "cat.s.t",
+    ])
+
+    _assert_scope_matches_membership(footprint, {"email", "ssn"})
+
+
+def test_mixed_case_whole_table_then_explicit_agree():
+    footprint = discover_agent_footprint(declared_footprint=[
+        "cat.s.t", "Cat.S.T.ssn",
+    ])
+
+    _assert_scope_matches_membership(footprint, {"email", "ssn"})
+
+
+def test_mixed_case_explicit_columns_are_unioned():
+    footprint = discover_agent_footprint(declared_footprint=[
+        "Cat.S.T.email", "cat.s.t.ssn",
+    ])
+
+    _assert_scope_matches_membership(footprint, {"email", "ssn"})
+
+
+def test_scope_and_membership_agree_across_footprint_permutations():
+    entries = [
+        "cat.s.*",
+        "Cat.S.T",
+        "cat.s.t.email",
+        "CAT.S.T.ssn",
+    ]
+    for size in range(1, 4):
+        for declared in permutations(entries, size):
+            footprint = discover_agent_footprint(declared_footprint=list(declared))
+            expected = {
+                column for column in ("email", "ssn")
+                if footprint_contains_column(footprint, f"cat.s.t.{column}")
+            }
+            _assert_scope_matches_membership(footprint, expected)
+
+
+def test_scoped_ddl_has_no_trailing_comma_on_last_column():
+    ddl = """CREATE TABLE cat.s.t (
+  email STRING,
+  ssn STRING,
+  notes STRING
+);"""
+    footprint = discover_agent_footprint(
+        declared_footprint=["cat.s.t.email", "cat.s.t.ssn"]
+    )
+
+    scoped = scope_ddl_to_footprint(ddl, footprint)
+    assert "ssn STRING," not in scoped
+    assert "ssn STRING\n);" in scoped

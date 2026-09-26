@@ -434,6 +434,7 @@ def discover_agent_footprint(
     import json as _json
 
     tables: dict[str, set[str]] = {}
+    table_display: dict[str, str] = {}
     whole_table: set[str] = set()
 
     def add(value, columns=None):
@@ -445,7 +446,9 @@ def discover_agent_footprint(
         table = _normalize_footprint_table(".".join(parts[:3])) if len(parts) >= 3 else ""
         if not table:
             return
-        tables.setdefault(table, set())
+        table_key = table.lower()
+        tables.setdefault(table_key, set())
+        table_display.setdefault(table_key, table)
         implied = parts[3] if len(parts) == 4 else ""
         col_values = columns if isinstance(columns, (list, tuple, set)) else ([columns] if columns else [])
         normalized_columns = {
@@ -454,10 +457,10 @@ def discover_agent_footprint(
         if implied:
             normalized_columns.add(implied)
         if normalized_columns:
-            tables[table].update(normalized_columns)
+            tables[table_key].update(normalized_columns)
         else:
             # A whole-table declaration supersedes any named columns for it.
-            whole_table.add(table)
+            whole_table.add(table_key)
 
     for entry in declared_footprint or []:
         add(entry)
@@ -498,8 +501,11 @@ def discover_agent_footprint(
             add(f"{catalog}.{schema}.{table}" + (f".{column}" if column else ""))
 
     return [
-        {"table": table, "columns": [] if table in whole_table else sorted(tables[table], key=str.lower)}
-        for table in sorted(tables, key=str.lower)
+        {
+            "table": table_display[table_key],
+            "columns": [] if table_key in whole_table else sorted(tables[table_key], key=str.lower),
+        }
+        for table_key in sorted(tables)
     ]
 
 
@@ -520,16 +526,20 @@ def footprint_contains_column(footprint: list[dict], column_fqn: str) -> bool:
             return True
         if footprint_table == table:
             columns = [str(value).lower() for value in (entry.get("columns") or [])]
-            return not columns or column in columns
+            if not columns or column in columns:
+                return True
     return False
 
 
 def scope_ddl_to_footprint(ddl_text: str, footprint: list[dict]) -> str:
     """Restrict fetched DDL columns to the canonical footprint when explicit."""
-    explicit = {
-        str(item["table"]).lower(): {str(column).lower() for column in (item.get("columns") or [])}
-        for item in footprint if item.get("table") and item.get("columns")
-    }
+    explicit: dict[str, set[str]] = {}
+    for item in footprint:
+        if item.get("table") and item.get("columns"):
+            table = str(item["table"]).lower()
+            explicit.setdefault(table, set()).update(
+                str(column).lower() for column in item["columns"]
+            )
     whole_tables = {
         str(item["table"]).lower()
         for item in footprint if item.get("table") and not item.get("columns")
@@ -556,6 +566,8 @@ def scope_ddl_to_footprint(ddl_text: str, footprint: list[dict]) -> str:
             name = line.strip().lstrip(",").split(None, 1)[0].strip("`,") if line.strip() else ""
             if name.lower() in wanted:
                 kept.append(line)
+        if kept:
+            kept[-1] = re.sub(r",\s*$", "", kept[-1])
         body = "\n" + "\n".join(kept) + "\n"
         return match.group(1) + body + match.group(4)
 

@@ -560,6 +560,35 @@ class TestValidatePolicyOverlaps:
         assert "filter_global_tables" in message
         assert "only one row filter" in message
 
+    def test_column_aware_row_filter_accepts_one_argument(self, tmp_path):
+        from validate_abac import validate_fgac_policies
+
+        cfg = {
+            "groups": {"analysts": {}},
+            "tag_policies": [{"key": "region_scope", "values": ["region_code"]}],
+            "fgac_policies": [{
+                "name": "filter_region",
+                "policy_type": "POLICY_TYPE_ROW_FILTER",
+                "catalog": "main",
+                "to_principals": ["analysts"],
+                "match_condition": "hasTagValue('region_scope', 'region_code')",
+                "match_alias": "region_code",
+                "function_name": "filter_allowed_region",
+                "function_catalog": "main",
+                "function_schema": "security",
+            }],
+        }
+        r = _result()
+        validate_fgac_policies(
+            cfg,
+            {"analysts"},
+            {"region_scope": {"region_code"}},
+            {"filter_allowed_region"},
+            r,
+            {"filter_allowed_region": 1},
+        )
+        assert not any("binds" in warning for warning in r.warnings)
+
 
 # ===========================================================================
 #  validate_acl_groups

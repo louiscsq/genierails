@@ -211,7 +211,12 @@ resource "databricks_policy_info" "policies" {
 
   when_condition = each.value.when_condition
 
-  match_columns = each.value.policy_type == "POLICY_TYPE_COLUMN_MASK" ? [{
+  # Column masks and column-aware row filters both bind matched column aliases.
+  # For a row filter, match_alias is passed to the function through `using`.
+  match_columns = (
+    contains(["POLICY_TYPE_COLUMN_MASK", "POLICY_TYPE_ROW_FILTER"], each.value.policy_type)
+    && each.value.match_condition != null
+  ) ? [{
     condition = each.value.match_condition
     alias     = each.value.match_alias
   }] : null
@@ -224,7 +229,9 @@ resource "databricks_policy_info" "policies" {
 
   row_filter = each.value.policy_type == "POLICY_TYPE_ROW_FILTER" ? {
     function_name = "${each.value.function_catalog}.${each.value.function_schema}.${each.value.function_name}"
-    using         = []
+    using = each.value.match_alias != null ? [{
+      alias = each.value.match_alias
+    }] : []
   } : null
 
   depends_on = [

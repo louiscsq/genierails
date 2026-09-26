@@ -727,16 +727,17 @@ def validate_fgac_policies(
                     f"Terraform prepends catalog.schema automatically"
                 )
             # Validate function argument count matches policy type.
-            # Row filters use `using = []` so the function must take 0 args.
+            # A row filter with match_alias binds that matched column through
+            # `using`; a row filter without an alias remains zero-argument.
             # Column masks get the column passed implicitly via on_column,
             # so the function must take exactly 1 arg.
             if sql_function_arg_counts and fn in sql_function_arg_counts:
                 argc = sql_function_arg_counts[fn]
-                if ptype == "POLICY_TYPE_ROW_FILTER" and argc != 0:
+                expected_row_filter_args = 1 if p.get("match_alias") else 0
+                if ptype == "POLICY_TYPE_ROW_FILTER" and argc != expected_row_filter_args:
                     result.warn(
                         f"{prefix}: ROW_FILTER function '{fn}' takes {argc} argument(s) "
-                        f"but row filters require 0-argument functions. Use a dedicated "
-                        f"filter function (e.g. filter_<name>()) that returns BOOLEAN."
+                        f"but this policy binds {expected_row_filter_args} argument(s)."
                     )
                 elif ptype == "POLICY_TYPE_COLUMN_MASK" and argc != 1:
                     result.warn(

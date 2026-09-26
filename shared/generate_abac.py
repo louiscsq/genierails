@@ -405,6 +405,175 @@ def _parse_str_field(val) -> str:
     return val or ""
 
 
+def _normalize_footprint_table(value: str) -> str:
+    """Return a stable three-part table identifier, or an empty string."""
+    value = (value or "").strip().strip("`\"")
+    value = ".".join(part.strip("`\"") for part in value.split("."))
+    return value if len(value.split(".")) == 3 else ""
+
+
+def discover_agent_footprint(
+    serialized_space: str | dict | None = None,
+    declared_footprint: list | None = None,
+    corroborated_footprint: list | None = None,
+) -> list[dict]:
+    """Enumerate the deterministic table/column footprint reachable by a Genie agent.
+
+    Sources are additive: explicitly declared entries support greenfield spaces,
+    while an existing space contributes its data sources and table/column
+    references found in SQL definitions (benchmarks, snippets and joins).  A
+    caller may pass workspace-corroborated entries (for example, successfully
+    readable UC table metadata) without coupling this pure merge routine to the
+    Databricks SDK.
+
+    Entries may be strings (``catalog.schema.table`` or a fully-qualified
+    column) or mappings with ``table``/``identifier`` and optional ``columns``.
+    The result is sorted and de-duplicated.  An empty columns list means the
+    whole table is reachable; otherwise columns are sorted and de-duplicated.
+    """
+    import json as _json
+
+    tables: dict[str, set[str]] = {}
+    table_display: dict[str, str] = {}
+    whole_table: set[str] = set()
+
+    def add(value, columns=None):
+        if isinstance(value, dict):
+            columns = value.get("columns", columns)
+            value = value.get("table") or value.get("identifier") or value.get("name") or ""
+        raw = str(value or "").strip().strip("`\"")
+        parts = [p.strip("`\"") for p in raw.split(".")]
+        table = _normalize_footprint_table(".".join(parts[:3])) if len(parts) >= 3 else ""
+        if not table:
+            return
+        table_key = table.lower()
+        tables.setdefault(table_key, set())
+        table_display.setdefault(table_key, table)
+        implied = parts[3] if len(parts) == 4 else ""
+        col_values = columns if isinstance(columns, (list, tuple, set)) else ([columns] if columns else [])
+        normalized_columns = {
+            str(c).split(".")[-1].strip().strip("`\"") for c in col_values if str(c).strip()
+        }
+        if implied:
+            normalized_columns.add(implied)
+        if normalized_columns:
+            tables[table_key].update(normalized_columns)
+        else:
+            # A whole-table declaration supersedes any named columns for it.
+            whole_table.add(table_key)
+
+    for entry in declared_footprint or []:
+        add(entry)
+    for entry in corroborated_footprint or []:
+        add(entry)
+
+    if isinstance(serialized_space, str):
+        try:
+            space = _json.loads(serialized_space)
+        except Exception:
+            space = {}
+    else:
+        space = serialized_space or {}
+
+    for entry in space.get("data_sources", {}).get("tables", []) or []:
+        add(entry)
+
+    # Genie definitions contain executable SQL outside data_sources.  Capture
+    # qualified table and column references so they cannot silently escape the
+    # declared scan/grant boundary.
+    sql_fragments: list[str] = []
+    snippets = space.get("instructions", {}).get("sql_snippets", {}) or {}
+    for kind in ("filters", "expressions", "measures"):
+        for item in snippets.get(kind, []) or []:
+            sql_fragments.append(_parse_str_field(item.get("sql", "")))
+    for join in space.get("instructions", {}).get("join_specs", []) or []:
+        add(join.get("left", {}).get("identifier", ""))
+        add(join.get("right", {}).get("identifier", ""))
+        sql_fragments.append(_parse_str_field(join.get("sql", "")))
+    for benchmark in space.get("benchmarks", {}).get("questions", []) or []:
+        for answer in benchmark.get("answer", []) or []:
+            if str(answer.get("format", "")).upper() == "SQL":
+                sql_fragments.append(_parse_str_field(answer.get("content", "")))
+
+    qualified = re.compile(r"(?<![\w.])`?([A-Za-z_]\w*)`?\s*\.\s*`?([A-Za-z_]\w*)`?\s*\.\s*`?([A-Za-z_]\w*)`?(?:\s*\.\s*`?([A-Za-z_]\w*)`?)?")
+    for sql in sql_fragments:
+        for catalog, schema, table, column in qualified.findall(sql or ""):
+            add(f"{catalog}.{schema}.{table}" + (f".{column}" if column else ""))
+
+    return [
+        {
+            "table": table_display[table_key],
+            "columns": [] if table_key in whole_table else sorted(tables[table_key], key=str.lower),
+        }
+        for table_key in sorted(tables)
+    ]
+
+
+def footprint_table_refs(footprint: list[dict]) -> list[str]:
+    """Return the canonical table list consumed by fetch/classification paths."""
+    return [entry["table"] for entry in footprint if entry.get("table")]
+
+
+def footprint_contains_column(footprint: list[dict], column_fqn: str) -> bool:
+    """Whether a classified column belongs to the coverage denominator."""
+    parts = column_fqn.split(".")
+    if len(parts) != 4:
+        return False
+    table, column = ".".join(parts[:3]).lower(), parts[3].lower()
+    for entry in footprint:
+        footprint_table = str(entry.get("table") or "").lower()
+        if footprint_table.endswith(".*") and table.startswith(footprint_table[:-1]):
+            return True
+        if footprint_table == table:
+            columns = [str(value).lower() for value in (entry.get("columns") or [])]
+            if not columns or column in columns:
+                return True
+    return False
+
+
+def scope_ddl_to_footprint(ddl_text: str, footprint: list[dict]) -> str:
+    """Restrict fetched DDL columns to the canonical footprint when explicit."""
+    explicit: dict[str, set[str]] = {}
+    for item in footprint:
+        if item.get("table") and item.get("columns"):
+            table = str(item["table"]).lower()
+            explicit.setdefault(table, set()).update(
+                str(column).lower() for column in item["columns"]
+            )
+    whole_tables = {
+        str(item["table"]).lower()
+        for item in footprint if item.get("table") and not item.get("columns")
+    }
+    if not explicit:
+        return ddl_text
+    pattern = re.compile(
+        r"(CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+([\w.`]+)\s*\()(.*?)(\)\s*;)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def replace(match: re.Match) -> str:
+        table = ".".join(part.strip("`") for part in match.group(2).split(".")).lower()
+        if table in whole_tables or any(
+            name.endswith(".*") and table.startswith(name[:-1])
+            for name in whole_tables | set(explicit)
+        ):
+            return match.group(0)
+        wanted = explicit.get(table)
+        if not wanted:
+            return match.group(0)
+        kept = []
+        for line in match.group(3).splitlines():
+            name = line.strip().lstrip(",").split(None, 1)[0].strip("`,") if line.strip() else ""
+            if name.lower() in wanted:
+                kept.append(line)
+        if kept:
+            kept[-1] = re.sub(r",\s*$", "", kept[-1])
+        body = "\n" + "\n".join(kept) + "\n"
+        return match.group(1) + body + match.group(4)
+
+    return pattern.sub(replace, ddl_text)
+
+
 def parse_genie_config_from_serialized_space(serialized: str, description: str = "") -> dict:
     """Parse a Genie Space's serialized_space JSON into a genie_space_configs dict.
 
@@ -790,8 +959,7 @@ def fetch_tables_from_genie_space(
     # --- Tables ---
     try:
         space_data = _json.loads(serialized)
-        tables = space_data.get("data_sources", {}).get("tables", [])
-        identifiers = [t["identifier"] for t in tables if "identifier" in t]
+        identifiers = footprint_table_refs(discover_agent_footprint(space_data))
     except Exception as e:
         print(f"  WARNING: Could not parse table list from Genie Space {space_id}: {e}")
         identifiers = []
@@ -4834,6 +5002,7 @@ def autofix_untagged_pii_columns(
     ddl_path: Path | None = None,
     sql_path: Path | None = None,
     classification_source: SensitivitySource | None = None,
+    agent_footprint: list[dict] | None = None,
 ) -> int:
     """Detect PII/sensitive columns in the DDL that the LLM forgot to tag.
 
@@ -4941,6 +5110,13 @@ def autofix_untagged_pii_columns(
     # supplied) takes precedence per column via select_findings.
     col_name_by_full = dict(all_columns)
     candidate_columns = [full for full, _ in all_columns if full not in existing_tags]
+    if agent_footprint is not None:
+        # The same canonical footprint that selected the classification tables
+        # also supplies the coverage-gate denominator at column granularity.
+        candidate_columns = [
+            column for column in candidate_columns
+            if footprint_contains_column(agent_footprint, column)
+        ]
 
     def _ddl_pattern_infer(cols: list[str]) -> list[Finding]:
         out: list[Finding] = []
@@ -6014,6 +6190,11 @@ def main():
              "(overrides uc_tables in env.auto.tfvars). "
              "E.g. prod.sales.customers or prod.sales.* for all tables in a schema",
     )
+    parser.add_argument(
+        "--footprint", nargs="+", metavar="CATALOG.SCHEMA.TABLE[.COLUMN]",
+        help="Declared reachable footprint for a not-yet-created Genie Space. "
+             "Accepts table or column FQNs and overrides declared_footprint/uc_tables.",
+    )
     parser.add_argument("--catalog", help="Catalog for masking UDFs (auto-derived from first uc_tables entry if omitted)")
     parser.add_argument("--schema", help="Schema for masking UDFs (auto-derived from first uc_tables entry if omitted)")
     parser.add_argument(
@@ -6204,13 +6385,14 @@ def main():
 
     catalog_schemas: list[tuple[str, str]] | None = None
 
-    # ── Auto-discover tables and config from genie_spaces entries ────────────
+    # ── Auto-discover the canonical reachable footprint ─────────────────────
     # For spaces where genie_space_id is set but uc_tables is empty, query the
     # Genie Space API to learn what tables and config that space contains.
     # The existing space's genie_space_configs is parsed verbatim from the API
     # (no LLM involvement) and injected into the generated abac.auto.tfvars
     # after the LLM runs, replacing whatever the LLM generated for that space.
     api_genie_configs: dict[str, dict] = {}  # space_name -> config parsed from API
+    footprint_entries: list = list(auth_cfg.get("declared_footprint", []) or [])
 
     if not args.tables:
         genie_spaces_cfg = auth_cfg.get("genie_spaces", [])
@@ -6223,6 +6405,8 @@ def main():
 
             for space in genie_spaces_cfg:
                 space_tables = space.get("uc_tables") or []
+                space_declared = space.get("declared_footprint") or []
+                footprint_entries.extend(space_declared or space_tables)
                 space_id = space.get("genie_space_id") or ""
                 space_name = space.get("name") or space_id
 
@@ -6246,6 +6430,7 @@ def main():
                     if not space_tables:
                         all_space_tables.extend(tables)
                         discovered_from_api.extend(tables)
+                        footprint_entries.extend(tables)
                     else:
                         all_space_tables.extend(space_tables)
 
@@ -6268,11 +6453,17 @@ def main():
                     "  UC grants and masking functions are applied to them as well."
                 )
 
-    # Resolve table refs: CLI --tables overrides uc_tables from config
-    table_refs = args.tables or auth_cfg.get("uc_tables") or None
+    # This canonical object is the single source for DDL/classification scan
+    # scope and, consequently, the classified-column coverage denominator.
+    configured = list(auth_cfg.get("uc_tables") or []) + footprint_entries
+    declared = args.footprint or args.tables or configured
+    agent_footprint = discover_agent_footprint(declared_footprint=declared)
+    table_refs = footprint_table_refs(agent_footprint) or None
 
     if table_refs:
-        source = "--tables CLI" if args.tables else "uc_tables in auth config"
+        source = "--footprint CLI" if args.footprint else ("--tables CLI" if args.tables else "agent footprint")
+        column_count = sum(len(item.get("columns") or []) for item in agent_footprint)
+        print(f"  Footprint: {len(agent_footprint)} table(s), {column_count} explicitly scoped column(s)")
         print(f"  Provider: {args.provider}")
         print(f"  Out dir:  {out_dir}")
         print(f"  Tables:   {', '.join(table_refs)} (from {source})")
@@ -6281,6 +6472,7 @@ def main():
         ddl_text, catalog_schemas = fetch_tables_from_databricks(
             table_refs, auth_cfg,
         )
+        ddl_text = scope_ddl_to_footprint(ddl_text, agent_footprint)
 
         if not catalog or not schema:
             if not catalog_schemas:
@@ -6670,6 +6862,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                 ddl_path=out_dir / "ddl" / "_fetched.sql" if out_dir else None,
                 sql_path=sql_path if sql_block else None,
                 classification_source=classification_source,
+                agent_footprint=agent_footprint,
             )
             if n_pii_tags:
                 print(f"  Auto-fixed: added {n_pii_tags} tag_assignment(s) for untagged PII columns")
@@ -6931,6 +7124,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                             ddl_path=out_dir / "ddl" / "_fetched.sql" if out_dir else None,
                             sql_path=sql_path if sql_block else None,
                             classification_source=classification_source,
+                            agent_footprint=agent_footprint,
                         )
                         autofix_tag_policies(tfvars_path)  # register new PII tag values
                     autofix_missing_fgac_policies(tfvars_path, sql_path if sql_block else None)

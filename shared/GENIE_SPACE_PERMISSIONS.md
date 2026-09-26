@@ -25,6 +25,13 @@ This document lists everything that must be in place for business users (the gro
 - **Unity Catalog:** At least **SELECT** (and **USE CATALOG** / **USE SCHEMA**) on all UC objects used by the Genie Space. Catalogs are auto-derived from fully-qualified table names in `tag_assignments` and `fgac_policies`. ABAC policies further restrict what each group sees at query time.
 - **Terraform:** The shared `data_access` layer grants `USE_CATALOG`, `USE_SCHEMA`, and `SELECT` on all relevant catalogs to all configured groups, deploys masking functions, creates tag policies, assigns tags, and creates FGAC policies.
 
+`make generate` now builds one canonical agent footprint from the Space's
+declared tables plus table/column references in its SQL definitions. That same
+footprint bounds the classification scan and coverage denominator. Before a
+Space exists, set `declared_footprint` on its `genie_spaces` entry (or pass
+`--footprint`) so discovery, coverage, and least-privilege grants do not depend
+on a live Genie API response.
+
 ## 5. Genie Space (create + ACLs)
 
 - **Genie Space:** Create a Genie Space with the tables from `uc_tables` (in `env.auto.tfvars`) and grant at least **CAN VIEW** and **CAN RUN** to all groups.

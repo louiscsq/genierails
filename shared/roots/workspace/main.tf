@@ -102,7 +102,7 @@ locals {
     (s.name != ""
       ? trim(replace(lower(s.name), "/[^a-z0-9]+/", "_"), "_")
       : s.genie_space_id
-    ) => {
+      ) => {
       name             = s.name != "" ? s.name : s.genie_space_id
       genie_space_id   = s.genie_space_id
       sql_warehouse_id = s.sql_warehouse_id != "" ? s.sql_warehouse_id : var.sql_warehouse_id
@@ -332,6 +332,12 @@ variable "groups" {
   default = {}
 }
 
+variable "business_access_enabled" {
+  type        = bool
+  default     = false
+  description = "Fail-closed exposure gate. Enable only after coverage validation and the schema drift check pass."
+}
+
 variable "group_members" {
   type    = map(list(string))
   default = {}
@@ -392,6 +398,7 @@ module "workspace" {
   genie_only                = var.genie_only
   manage_groups             = var.manage_groups
   groups                    = var.groups
+  business_access_enabled   = var.business_access_enabled
   sql_warehouse_id          = var.sql_warehouse_id
   warehouse_name            = var.warehouse_name
   genie_spaces              = local.merged_spaces

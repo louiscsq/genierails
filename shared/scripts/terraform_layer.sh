@@ -199,6 +199,9 @@ case "$COMMAND" in
   output)
     CMD=(terraform output "$@")
     ;;
+  show-json)
+    CMD=(terraform show -json "$@")
+    ;;
   print-cmd)
     printf 'terraform %s (in %s, TF_DATA_DIR=%s)' "$1" "$ROOT_DIR" "$TF_DATA_DIR"
     shift || true

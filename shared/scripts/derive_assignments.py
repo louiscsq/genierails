@@ -34,6 +34,7 @@ from treatment_derivation import (  # noqa: E402
     derive_treatment_model,
     load_treatment_config,
 )
+from governance_policies import FAILSAFE_TREATMENT  # noqa: E402
 from scripts.coverage_gate import write_refresh_record  # noqa: E402
 from scripts.footprint import FootprintError, resolve_footprint  # noqa: E402
 from scripts.sticky_governance import load_governed_tables, record  # noqa: E402
@@ -172,8 +173,9 @@ def derive_assignments(
     unmapped = native.unmapped_columns(sorted(native.classified_columns()))
     if unmapped:
         details = ", ".join(f"{column}=class.{semantic}" for column, semantic in unmapped)
-        raise NativeClassificationRequiredError(
-            f"Native classification contains unmapped class.* findings: {details}"
+        print(
+            "WARNING: Unmapped class.* findings are fail-closed with the never-raw "
+            f"redacted treatment: {details}", file=sys.stderr,
         )
     native_assignments = [
         finding.as_assignment()
@@ -203,13 +205,24 @@ def derive_assignments(
             "tag_key": config.tag_key,
             "tag_value": treatment,
         })
+    override_assignments.extend({
+        "entity_type": "columns", "entity_name": column,
+        "tag_key": config.tag_key, "tag_value": FAILSAFE_TREATMENT,
+    } for column, _semantic in unmapped)
     retained = _retained_promoted_assignments(
         list(promoted.get("tag_assignments") or []), config
     )
     # Use the exact treatment transform used by generate. Only its assignments
     # are consumed; its rebuilt policy model is intentionally discarded.
     derived, _changes = derive_treatment_model(
-        {"tag_assignments": retained + native_assignments + override_assignments}, config
+        {"tag_assignments": retained + native_assignments + override_assignments}, config,
+        deterministic_settings={
+            "access_tier_groups": runtime.get("access_tier_groups") or [],
+            "raw_exempt_principals": runtime.get("raw_exempt_principals") or [],
+            "deployer_principal": runtime.get("databricks_client_id") or "",
+            "function_schema": next((p.get("function_schema") for p in promoted.get("fgac_policies") or []
+                                     if p.get("function_schema")), "default"),
+        } if runtime.get("governance_mode", "legacy") == "deterministic" else None,
     )
     sensitivity_keys = {
         key for treatment in config.treatments for key, _value in treatment.sources

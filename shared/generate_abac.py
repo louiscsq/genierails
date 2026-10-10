@@ -3066,7 +3066,9 @@ def _render_fgac_policy_block(policy: dict) -> str:
     return "\n".join(lines)
 
 
-def derive_enforcement_treatments(tfvars_path: Path) -> int:
+def derive_enforcement_treatments(
+    tfvars_path: Path, *, deterministic_settings: dict | None = None,
+) -> int:
     """Materialize one ``gr_treatment`` value and mask per sensitive column."""
     try:
         import hcl2
@@ -3096,6 +3098,7 @@ def derive_enforcement_treatments(tfvars_path: Path) -> int:
         cfg,
         load_treatment_config(),
         capture_source_less_explicit=not already_derived,
+        deterministic_settings=deterministic_settings,
     )
     if not changes:
         return 0
@@ -3178,9 +3181,12 @@ def derive_and_finalize_treatments(
     tfvars_path: Path,
     *,
     native_authoritative: bool,
+    deterministic_settings: dict | None = None,
 ) -> tuple[int, int]:
     """Run the identical treatment finalization used by initial and retry paths."""
-    derived = derive_enforcement_treatments(tfvars_path)
+    derived = derive_enforcement_treatments(
+        tfvars_path, deterministic_settings=deterministic_settings,
+    )
     stripped = strip_native_source_assignments(tfvars_path) if native_authoritative else 0
     return derived, stripped
 
@@ -3232,6 +3238,33 @@ def ensure_derived_treatment_functions(tfvars_path: Path, sql_path: Path | None)
         )
     sql_path.write_text(sql + "\n" + "\n".join(blocks) + "\n")
     return len(missing)
+
+
+def ensure_deterministic_mask_functions(tfvars_path: Path, sql_path: Path | None) -> int:
+    """Append exactly the library functions referenced by deterministic policies."""
+    if not sql_path or not sql_path.exists():
+        return 0
+    from governance_policies import render_mask_functions
+    cfg = hcl2.loads(tfvars_path.read_text())
+    targets: dict[tuple[str, str], set[str]] = {}
+    for policy in cfg.get("fgac_policies") or []:
+        name = str(policy.get("function_name") or "")
+        match = re.fullmatch(r"gr_mask_(.+)_(partial|full)", name)
+        if match:
+            targets.setdefault(
+                (str(policy.get("function_catalog") or ""), str(policy.get("function_schema") or "default")), set()
+            ).add(match.group(1))
+    marker = "-- === GenieRails deterministic mask library ==="
+    original = sql_path.read_text()
+    base = original.split(marker, 1)[0].rstrip()
+    rendered = "\n\n".join(
+        render_mask_functions(sorted(treatments), catalog=catalog, schema=schema).rstrip()
+        for (catalog, schema), treatments in sorted(targets.items()) if catalog
+    )
+    updated = base + ((f"\n\n{marker}\n{rendered}\n") if rendered else "\n")
+    if updated != original:
+        sql_path.write_text(updated)
+    return sum(len(values) for values in targets.values())
 
 
 def _parse_sql_function_names(sql_path: Path | None) -> set[str]:
@@ -8590,9 +8623,18 @@ Before you apply, tune for your business roles, security requirements, and Genie
                     print(f"  Derived ACL sidecar for {n_acl} Genie agent(s)")
 
         if args.mode != "genie":
+            deterministic_settings = None
+            if auth_cfg.get("governance_mode", "legacy") == "deterministic":
+                deterministic_settings = {
+                    "access_tier_groups": auth_cfg.get("access_tier_groups") or [],
+                    "raw_exempt_principals": auth_cfg.get("raw_exempt_principals") or [],
+                    "deployer_principal": auth_cfg.get("databricks_client_id") or "",
+                    "function_schema": schema or "default",
+                }
             n_treatments, n_native_sources = derive_and_finalize_treatments(
                 tfvars_path,
                 native_authoritative=classification_source is not None,
+                deterministic_settings=deterministic_settings,
             )
             if n_treatments:
                 print(f"  Derived GenieRails enforcement treatments ({n_treatments} change(s))")
@@ -8605,6 +8647,10 @@ Before you apply, tune for your business roles, security requirements, and Genie
             ensure_derived_treatment_functions(
                 tfvars_path, sql_path if sql_block else None,
             )
+            if deterministic_settings is not None:
+                ensure_deterministic_mask_functions(
+                    tfvars_path, sql_path if sql_block else None,
+                )
 
         # Check the hard UC quota after Option-B has collapsed masks to one
         # policy per treatment/catalog. Never delete policies to fit the cap.

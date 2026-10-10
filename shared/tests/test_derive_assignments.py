@@ -133,6 +133,33 @@ def test_refresh_fails_closed_on_unmapped_native_class(tmp_path, monkeypatch):
     assert config.read_bytes() == before
 
 
+def test_deterministic_refresh_fail_safe_redacts_unmapped_native_class(tmp_path, monkeypatch):
+    config, auth, env = _files(tmp_path)
+    env.write_text('''
+governance_mode = "deterministic"
+uc_catalog = "prod"
+uc_tables = ["sales.customers"]
+access_tier_groups = ["raw", "partial", "full"]
+raw_exempt_principals = ["etl"]
+''')
+    (tmp_path / "generated" / "governed_tables.json").write_text(
+        '{"tables":["prod.sales.customers"]}\n'
+    )
+    native = ClassificationSource(tag_rows=[
+        ("prod", "sales", "customers", "secret", "class.future_secret", ""),
+    ])
+    monkeypatch.setattr(MODULE, "_fetch_live_classification_source", lambda *a, **k: native)
+
+    assert MODULE.derive_assignments(config, auth, env) == 1
+    parsed = hcl2.loads(config.read_text())
+    assignment = next(a for a in parsed["tag_assignments"] if a.get("entity_name", "").endswith(".secret"))
+    assert assignment["tag_value"] == "unmapped_redact"
+    fallback = [p for p in parsed["fgac_policies"] if "unmapped_redact" in p.get("name", "")]
+    assert len(fallback) == 1
+    assert fallback[0]["to_principals"] == ["account users"]
+    assert fallback[0].get("except_principals", []) == []
+
+
 def test_refresh_fails_closed_when_promoted_mask_does_not_cover_treatment(tmp_path, monkeypatch):
     config, auth, env = _files(tmp_path)
     original = config.read_text()

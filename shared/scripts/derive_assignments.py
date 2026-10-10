@@ -21,12 +21,14 @@ from generate_abac import (  # noqa: E402
     _fetch_live_classification_source,
     _find_bracket_section,
     _render_tag_assignment_block,
+    _render_fgac_policy_block,
     _replace_bracket_section,
     discover_agent_footprint,
     fetch_tables_from_databricks,
     footprint_contains_column,
     footprint_table_refs,
     load_auth_config,
+    ensure_deterministic_mask_functions,
     scope_ddl_to_footprint,
 )
 from treatment_derivation import (  # noqa: E402
@@ -173,10 +175,12 @@ def derive_assignments(
     unmapped = native.unmapped_columns(sorted(native.classified_columns()))
     if unmapped:
         details = ", ".join(f"{column}=class.{semantic}" for column, semantic in unmapped)
-        print(
-            "WARNING: Unmapped class.* findings are fail-closed with the never-raw "
-            f"redacted treatment: {details}", file=sys.stderr,
-        )
+        if runtime.get("governance_mode", "legacy") != "deterministic":
+            raise NativeClassificationRequiredError(
+                f"Native classification contains unmapped class.* findings: {details}"
+            )
+        print("WARNING: Unmapped class.* findings are fail-closed with the never-raw "
+              f"redacted treatment: {details}", file=sys.stderr)
     native_assignments = [
         finding.as_assignment()
         for finding in native.findings_for(sorted(native.classified_columns()))
@@ -208,7 +212,7 @@ def derive_assignments(
     override_assignments.extend({
         "entity_type": "columns", "entity_name": column,
         "tag_key": config.tag_key, "tag_value": FAILSAFE_TREATMENT,
-    } for column, _semantic in unmapped)
+    } for column, _semantic in unmapped if runtime.get("governance_mode") == "deterministic")
     retained = _retained_promoted_assignments(
         list(promoted.get("tag_assignments") or []), config
     )
@@ -239,16 +243,28 @@ def derive_assignments(
             and item.get("tag_key") in sensitivity_keys
         )
     ]
-    _assert_promoted_masks_cover(refreshed, promoted, config.tag_key)
+    effective_rules = promoted
+    if runtime.get("governance_mode", "legacy") == "deterministic":
+        effective_rules = dict(promoted)
+        effective_rules["fgac_policies"] = derived.get("fgac_policies") or []
+    _assert_promoted_masks_cover(refreshed, effective_rules, config.tag_key)
     record(env_path.parent, refreshed, config.tag_key)
     updated = _replace_bracket_section(
         original,
         "tag_assignments",
         [_render_tag_assignment_block(item) for item in refreshed],
     )
+    if runtime.get("governance_mode", "legacy") == "deterministic":
+        updated = _replace_bracket_section(
+            updated, "fgac_policies",
+            [_render_fgac_policy_block(item) for item in effective_rules["fgac_policies"]],
+        )
     if updated == original:
         return 0
     config_path.write_text(updated)
+    ensure_deterministic_mask_functions(
+        config_path, config_path.with_name("masking_functions.sql"),
+    )
     return sum(1 for item in refreshed if item.get("tag_key") == config.tag_key)
 
 

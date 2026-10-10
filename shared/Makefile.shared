@@ -479,7 +479,9 @@ _COVERAGE_GATE = python3 "$(SHARED_ROOT)/scripts/coverage_gate.py"
 # the gate then fails closed, and Terraform only lets through changes that
 # keep or revoke SELECT / CAN_RUN, so revocation never waits on Unity Catalog.
 _derive-before-exposure:
-	@mode="$$($(_COVERAGE_GATE) needs-derive --env-dir "$(ENV_DIR)" --apply-flags="$(APPLY_FLAGS)")" || exit 1; \
+	@governance_mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
+	if [ "$$governance_mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; \
+	mode="$$($(_COVERAGE_GATE) needs-derive --env-dir "$(ENV_DIR)" --apply-flags="$(APPLY_FLAGS)")" || exit 1; \
 	refreshed=1; \
 	case "$$mode" in \
 		full) $(MAKE) --no-print-directory derive-assignments ENV="$(ENV)" || refreshed=0 ;; \
@@ -545,9 +547,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		echo "rehearse: ENV=prod is not allowed; use make release ENV=prod" >&2; \
 		exit 1; \
 	fi; \
-	$(_DRY_RUN_GUARD); mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" && \
-		{ [ "$$mode" != deterministic ] || python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"; } && \
-		$(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
+	$(_DRY_RUN_GUARD); $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 		$(MAKE) validate-generated ENV="$(ENV)" && \
 		$(MAKE) coverage-gate ENV="$(ENV)" && \
 		$(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 && \

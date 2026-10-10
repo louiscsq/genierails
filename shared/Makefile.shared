@@ -518,10 +518,12 @@ _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	fi
 
 _guard-account-plan-empty:
-	@plan_file="$(ACCOUNT_ENV_DIR)/.rehearse-account.tfplan"; \
-	trap 'rm -f "$$plan_file"' EXIT; \
-	"$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -out="$$plan_file" >/dev/null && \
-	"$(ROOT_RUNNER)" account $(ACCOUNT_ENV) show-json "$$plan_file" | python3 "$(SHARED_ROOT)/scripts/check_account_plan.py"
+	@set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
+	if [ $$status -eq 2 ]; then \
+		echo "ERROR: account plan is non-empty; rehearse/release may only add allowed treatment-tag values." >&2; \
+		echo "Run 'make apply-account' in the approved operations stage." >&2; exit 1; \
+	fi; \
+	if [ $$status -ne 0 ]; then echo "ERROR: account plan failed." >&2; exit $$status; fi
 
 _apply-account-for-workspace:
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
